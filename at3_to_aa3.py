@@ -47,6 +47,14 @@ FRAME_TO_KBPS = {
 
 HEADER_TOTAL = ID3V2_HEADER_SIZE + EA3_HEADER_SIZE   # 106
 
+# 【关键】索尼所有原厂 OMA 的 ID3v2 标签长度都是这个数的整数倍：
+#   无封面 3072（=1024×3）      带封面 150528（=1024×147）
+# 实测 32 个原厂文件，无一例外。
+# 我们自己插帧后长度不再对齐，PSP 会出现「封面能显示、声音放不出来」——
+# 它按对齐后的长度推算音频起始偏移，于是从错误位置开始解码，帧同步失败。
+# 所以插完帧必须把标签补回 ID3_PAD_UNIT 的整数倍。
+ID3_PAD_UNIT = 1024
+
 # ---- 专辑封面 ----
 # 索尼不用标准 APIC，而是塞进两个 **GEOB** 帧（实测自 SonicStage 转出的 .OMA）：
 #   OMG_FENCA1  主封面   image/jpeg
@@ -550,7 +558,20 @@ def _geob_desc(tag, doff, size):
     return b[i:k].decode("utf-16-be", "replace")
 
 
-def insert_frames(hdr, blk, blob, after_desc=None, pad_to=None):
+def align_id3_tag(tag, unit=ID3_PAD_UNIT):
+    """把 ID3v2 标签（含 10 字节头）补 0 到 unit 的整数倍。
+
+    索尼原厂文件一律如此；不对齐时 PSP 会「显示封面但放不出声」。
+    """
+    r = len(tag) % unit
+    if r == 0:
+        return bytes(tag)
+    body = bytes(tag[ID3V2_HEADER_SIZE:]) + b"\x00" * (unit - r)
+    return (ID3V2_EA3_MAGIC + bytes([3, 0]) + b"\x00" +
+            synchsafe(len(body)) + body)
+
+
+def insert_frames(hdr, blk, blob, after_desc=None, pad_to=None, align=True):
     """把若干帧插进 ID3v2 标签，重建头部。
 
     hdr  = [ID3v2 标签][EA3 96B]，blk = EA3 块起始 = ID3v2 标签总长
@@ -582,8 +603,10 @@ def insert_frames(hdr, blk, blob, after_desc=None, pad_to=None):
             raise RuntimeError("内容太大：头部需要 %d 字节，超过 pad_to=%d"
                                % (total, pad_to))
         body += b"\x00" * (pad_to - total)
-    new = (ID3V2_EA3_MAGIC + bytes([3, 0]) + b"\x00" + synchsafe(len(body)))
-    return bytes(new) + body + ea3, ID3V2_HEADER_SIZE + len(body)
+    new = (ID3V2_EA3_MAGIC + bytes([3, 0]) + b"\x00" + synchsafe(len(body)) + body)
+    if pad_to is None and align:
+        new = align_id3_tag(new)          # 补回 1024 对齐，否则 PSP 放不出声
+    return bytes(new) + ea3, len(new)
 
 
 def frame_desc(tag, doff, size):
@@ -728,9 +751,14 @@ def build_from_template(tpl, blk, codec_id, channels, sample_rate,
         thumb_f = build_geob(cover, SONY_COVER_THUMB) + (
             build_apic(cover) if apic else b"")
         # 插帧会改变标签长度 → blk（EA3 块偏移）也随之改变
-        newhdr, blk = insert_frames(hdr, blk, main_f, after_desc=SONY_BKLSI)
+        # 只在最后一次插帧时对齐（插两次的话中间那次会白补一层 1024）
+        newhdr, blk = insert_frames(hdr, blk, main_f, after_desc=SONY_BKLSI,
+                                    align=False)
         newhdr, blk = insert_frames(newhdr, blk, thumb_f, pad_to=pad_to)
         return newhdr + frames, params
+    # 无封面：模板（3168）本来就是对齐的；万一不是，也补一下
+    if blk % ID3_PAD_UNIT:
+        return align_id3_tag(bytes(hdr[:blk])) + bytes(hdr[blk:]) + frames, params
     return bytes(hdr) + frames, params
 
 
