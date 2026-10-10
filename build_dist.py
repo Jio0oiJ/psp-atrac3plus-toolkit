@@ -18,12 +18,15 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FF = os.path.join(ROOT, "tools", "ffmpeg-9.0.2-essentials_build", "bin", "ffmpeg.exe")
+ICO = os.path.join(ROOT, "app.ico")
 EXE = "ATRAC3plus转PSP"
 
 
-def pyi(extra):
+def pyi(extra, icon=True):
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
            "--onefile", "--windowed", "--name", EXE, "--collect-all", "PIL"]
+    if icon and os.path.isfile(ICO):
+        cmd += ["--icon", ICO]
     cmd += extra + ["atrac3plus_gui.py"]
     print(">>>", " ".join(cmd))
     r = subprocess.run(cmd, cwd=ROOT)
@@ -46,7 +49,7 @@ def main():
     # ---------- 1) 便携版 ----------
     shutil.rmtree(os.path.join(ROOT, "dist"), ignore_errors=True)
     pyi(["--distpath", "dist", "--workpath", os.path.join("build", "portable")]
-        + add(*common))
+        + add(*common, ICO))
 
     bindir = os.path.join(ROOT, "dist", "bin")
     os.makedirs(bindir, exist_ok=True)
@@ -60,7 +63,7 @@ def main():
     # ---------- 2) 单文件版 ----------
     shutil.rmtree(os.path.join(ROOT, "dist_single"), ignore_errors=True)
     pyi(["--distpath", "dist_single", "--workpath", os.path.join("build", "single")]
-        + add(*common, FF))
+        + add(*common, FF, ICO))
     shutil.copy2(os.path.join(ROOT, "README.md"),
                  os.path.join(ROOT, "dist_single", "README.md"))
     print("\n[单文件版] dist_single/ 完成")

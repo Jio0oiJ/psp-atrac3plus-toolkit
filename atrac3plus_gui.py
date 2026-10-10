@@ -72,6 +72,10 @@ def load_config():
             cfg.update(json.load(f))
     except Exception:
         pass
+    # 上次记住的输出目录已经不在了（U 盘拔了 / 文件夹删了 / 盘符变了）
+    # → 留空，别填一个点不开的无效路径
+    if not os.path.isdir(cfg.get("outdir", "")):
+        cfg["outdir"] = ""
     return cfg
 
 
@@ -81,6 +85,22 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def set_window_icon(root):
+    """给窗口左上角 / 任务栏设图标。
+
+    exe 版图标已经嵌在 exe 里（PyInstaller --icon），窗口会自己继承；
+    但直接跑 .py 或图标没嵌进去时，就找同目录 / 内置的 app.ico 补一下。
+    """
+    for c in (os.path.join(exe_dir(), "app.ico"),
+              os.path.join(bundle_dir(), "app.ico")):
+        if os.path.isfile(c):
+            try:
+                root.iconbitmap(default=c)      # default=True 时对子窗口也生效
+                return
+            except Exception:
+                pass
 
 
 def bundle_dir():
@@ -116,6 +136,29 @@ def find_ffmpeg():
 
 # 中间文件（WAV / .at3）统一放这里，不落在输出目录里
 TMP_ROOT = os.path.join(tempfile.gettempdir(), "psp_atrac3plus_tmp")
+
+
+def mark_temporary(path):
+    """给临时文件打上 FILE_ATTRIBUTE_TEMPORARY（仅 Windows，失败了也无所谓）。
+
+    at3tool 的 -e 只吃**真实可 seek 的文件**——试过 `-`（cannot open）和
+    命名管道（能打开，但它要 fseek/ftell 取文件大小，报 "illegal file"），
+    所以 ffmpeg → at3tool 没法真做管线，中间 WAV 躲不掉。
+    退而求其次：标成 TEMPORARY 后，Windows 缓存管理器会尽量把它留在内存里、
+    不往磁盘写（反正转完就删），能省掉大部分实际落盘。
+    """
+    if os.name != "nt":
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.CreateFileW(path, 0x40000000,            # GENERIC_WRITE
+                            0x00000001 | 0x00000002 | 0x00000004,  # share r/w/delete
+                            None, 2,                     # CREATE_ALWAYS
+                            0x100, None)                 # FILE_ATTRIBUTE_TEMPORARY
+        if h not in (-1, 0xFFFFFFFF):
+            k32.CloseHandle(h)
+    except Exception:
+        pass
 
 
 def tmp_workdir(idx):
@@ -204,6 +247,7 @@ class App:
         root.title(APP_TITLE)
         root.geometry("900x680")
         root.minsize(800, 600)
+        set_window_icon(root)
 
         self.cfg = load_config()
         self.tools = {"at3tool": find_at3tool(), "ffmpeg": find_ffmpeg()}
@@ -628,6 +672,8 @@ class App:
                 cmd = [ffmpeg, "-v", "error", "-y", "-i", src_abs,
                        "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", tmp_wav]
                 self.q.put(("log", "   ffmpeg → 44100Hz/16bit/立体声 WAV"))
+                # 标成 TEMPORARY，Windows 会尽量只把它留在缓存里、不写回磁盘
+                mark_temporary(tmp_wav)
                 r = subprocess.run(cmd, capture_output=True, cwd=cwd, **hidden)
                 if r.returncode != 0 or not os.path.isfile(tmp_wav):
                     err = (r.stderr or b"").decode("utf-8", "replace").strip()
@@ -639,6 +685,7 @@ class App:
 
             # --- 2) at3tool 编码 ---
             self.q.put(("log", "   at3tool -e -br %s" % br))
+            mark_temporary(at3_path)
             r = subprocess.run([at3tool, "-e", "-br", br, wav_path, at3_path],
                                capture_output=True, cwd=cwd, **hidden)
             if r.returncode != 0 or not os.path.isfile(at3_path):

@@ -60,8 +60,17 @@ E:\PSP\范特西\Disc2\02. 爸我回来了.aa3
 （`%TEMP%\psp_atrac3plus_tmp`），**不会**落到输出目录里弄脏文件。
 每个文件一个独立子目录，转完自动清理。勾选「保留中间文件」时它们会留在那里。
 
+这些中间文件还会被标上 `FILE_ATTRIBUTE_TEMPORARY`，
+Windows 缓存管理器会尽量只把它们留在内存里、不写回磁盘 —— 转换过程基本不产生实际落盘。
+
 调用 ffmpeg / at3tool 时不会弹出命令行黑框（`CREATE_NO_WINDOW`），
 界面上只在日志里看到进度。
+
+> **为什么不做真正的管线（ffmpeg 直连 at3tool）？** 试过了，走不通。
+> `at3tool -e` 的输入只能是真实文件：用 `-` 当文件名报 `cannot open -`；
+> 用 Windows 命名管道虽然能打开，但它内部要 `fseek/ftell` 拿文件大小，
+> 管道不可 seek，直接报 `input file is illegal file or over 2G Byte`。
+> 所以中间 WAV 这个「物料暂存」躲不掉，只能尽量让它别真写盘。
 
 ### 封面怎么放
 
@@ -122,6 +131,17 @@ python at3_to_aa3.py D:\music\at3\     # 整个文件夹递归
 - 本工具**仍然两种都写**：GEOB×2 给 SonicStage / Walkman 看，
   APIC 给 PSP 看、顺带让 foobar2000 / Windows 资源管理器等第三方也能读到。
   代价只是每个文件多 12 KB。想省就用 `--no-apic`（PSP 照样能显示）。
+
+## 图标
+
+`app.ico` 是程序图标（窗口左上角 + 任务栏 + exe 文件图标），由 `make_icon.py`
+用 Pillow 画出来：圆角渐变方块 + 白色八分音符。改配色或换符号改这个脚本再跑一遍：
+
+```bash
+python make_icon.py      # 生成 app.ico（16~256 九个尺寸）和 app_preview.png
+```
+
+打包时 `build_dist.py` 会自动带上 `--icon app.ico`。
 
 ### 一个坑：ID3 标签必须补到 1024 的整数倍
 

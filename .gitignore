@@ -5,6 +5,8 @@
 !/at3_to_aa3.py
 !/atrac3plus_gui.py
 !/build_dist.py
+!/make_icon.py
+!/app.ico
 !/oma_header.bin
 !/psp_at3tool.exe
 !/msvcr71.dll
