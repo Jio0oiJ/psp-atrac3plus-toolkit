@@ -1,0 +1,26 @@
+# 白名单模式：默认全部忽略，只发布下面显式放行的文件
+/*
+!/.gitignore
+!/README.md
+!/at3_to_aa3.py
+!/atrac3plus_gui.py
+!/at3_inspect.py
+!/make_test_at3.py
+!/make_experiment.py
+!/oma_header.bin
+!/ATRAC3plus转换链路分析.md
+!/dist/
+/dist/*
+!/dist/ATRAC3plus转PSP.exe
+!/dist/at3_to_aa3.exe
+!/dist/psp_at3tool.exe
+!/dist/msvcr71.dll
+!/dist/oma_header.bin
+
+# ffmpeg.exe 100.54 MiB，超过 GitHub 单文件 100 MiB 上限，不放进仓库
+# 请在 Releases 页面下载，放到程序同目录即可
+
+# 本机配置（含个人路径），不上传
+atrac3plus_gui.json
+__pycache__/
+*.pyc
