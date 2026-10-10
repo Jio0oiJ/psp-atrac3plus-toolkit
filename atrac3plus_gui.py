@@ -114,6 +114,9 @@ class App:
         self.tools = {"at3tool": find_at3tool(), "ffmpeg": find_ffmpeg()}
 
         self.files = []
+        # 文件 → 它所属的根目录（只有「添加文件夹」加进来的才有）。
+        # 有根目录时，输出到别处会按相对路径重建原来的目录结构。
+        self.file_root = {}
         self.q = queue.Queue()
         self.worker = None
         self.stop_flag = False
@@ -182,7 +185,8 @@ class App:
         ttk.Label(opt, text="输出目录：").grid(row=1, column=0, sticky="w", **pad)
         ttk.Entry(opt, textvariable=self.v_out).grid(row=1, column=1, sticky="ew", **pad)
         ttk.Button(opt, text="浏览", command=self._pick_outdir).grid(row=1, column=2, sticky="w", **pad)
-        ttk.Label(opt, text="（留空 = 与源文件同目录）").grid(row=1, column=3, sticky="w")
+        ttk.Label(opt, text="（留空 = 与源文件同目录；填写则保留原目录结构）").grid(
+            row=1, column=3, sticky="w")
 
         self.v_keep_at3 = tk.BooleanVar(value=self.cfg.get("keep_at3", False))
         self.v_keep_wav = tk.BooleanVar(value=self.cfg.get("keep_wav", False))
@@ -271,6 +275,7 @@ class App:
         d = filedialog.askdirectory(title="选择文件夹（会递归扫描音频文件）")
         if not d:
             return
+        d = os.path.abspath(d)
         n = 0
         for root, _dirs, names in os.walk(d):
             for fn in sorted(names):
@@ -279,18 +284,25 @@ class App:
                     if p not in self.files:
                         self.files.append(p)
                         self.listbox.insert("end", p)
+                        # 记住它属于哪个文件夹，输出时好还原目录结构
+                        self.file_root[os.path.abspath(p)] = d
                         n += 1
-        self._log("从文件夹加入了 %d 个文件" % n)
+        top = os.path.basename(d) or d
+        self._log("从文件夹加入了 %d 个文件：%s" % (n, d))
+        self._log("  指定了输出目录时会保留目录结构，例如 %s\\<子目录>\\<文件名>.aa3"
+                  % top)
 
     def _remove_sel(self):
         sel = list(self.listbox.curselection())[::-1]
         for i in sel:
             self.listbox.delete(i)
+            self.file_root.pop(os.path.abspath(self.files[i]), None)
             del self.files[i]
 
     def _clear(self):
         self.listbox.delete(0, "end")
         self.files = []
+        self.file_root = {}
 
     def _open_outdir(self):
         d = self.v_out.get()
@@ -383,7 +395,23 @@ class App:
                 break
             name = os.path.basename(src)
             base = os.path.splitext(name)[0]
-            dst_dir = outdir if outdir else os.path.dirname(src)
+            src_abs = os.path.abspath(src)
+            # 「添加文件夹」进来的文件，输出到别处时按相对路径重建目录结构。
+            # 以文件夹的**上一级**为基准，这样文件夹自己的名字也保留下来
+            # （例如加 D:\音乐\范特西 → 输出 <out>\范特西\01.xxx.aa3）
+            root = self.file_root.get(src_abs)
+            if outdir and root:
+                rel = os.path.relpath(os.path.dirname(src_abs),
+                                      os.path.dirname(root))
+                dst_dir = os.path.normpath(os.path.join(outdir, rel))
+                disp = os.path.normpath(os.path.relpath(
+                    src_abs, os.path.dirname(root)))
+            elif outdir:
+                dst_dir = outdir
+                disp = name
+            else:
+                dst_dir = os.path.dirname(src_abs)
+                disp = name
             try:
                 os.makedirs(dst_dir, exist_ok=True)
             except Exception as e:
@@ -391,12 +419,11 @@ class App:
                 fail += 1
                 continue
 
-            self.q.put(("log", "── %s" % name))
+            self.q.put(("log", "── %s" % disp))
             # 必须绝对路径：子进程 cwd 会被设成 at3tool 所在目录（找 msvcr71.dll），
             # 相对路径会被解析到那里去
             tmp_wav = os.path.abspath(os.path.join(dst_dir, base + "__pcm.wav"))
             at3_path = os.path.abspath(os.path.join(dst_dir, base + ".at3"))
-            src_abs = os.path.abspath(src)
 
             # --- 1) 准备 16bit PCM WAV ---
             if wav_is_ready(src_abs):
