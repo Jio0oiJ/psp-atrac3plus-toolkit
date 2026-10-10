@@ -218,12 +218,11 @@ class App:
         self.psp_devs = []
         self._psp_active = False
         self._last_outdir = ""
+        # 用户手动取消过勾选 → 之后扫描到设备也不再自动勾上（尊重手动选择）
+        self._psp_user_off = not self.cfg.get("to_psp", True)
 
         self._build_ui()
         self._scan_psp()
-        if self.cfg.get("to_psp") and self.psp_devs:
-            self.v_to_psp.set(True)
-            self._toggle_psp()
         self._poll()
 
     # ---------------- UI ----------------
@@ -313,10 +312,10 @@ class App:
                                    state="readonly")
         self.cb_psp.pack(side="left", **pad)
         ttk.Button(pspf, text="刷新", command=self._scan_psp).pack(side="left", **pad)
-        self.v_to_psp = tk.BooleanVar(value=self.cfg.get("to_psp", False))
+        self.v_to_psp = tk.BooleanVar(value=False)
         ttk.Checkbutton(pspf, text="直接输出到该设备的 MUSIC 文件夹",
                         variable=self.v_to_psp,
-                        command=self._toggle_psp).pack(side="left", **pad)
+                        command=self._on_psp_check).pack(side="left", **pad)
         self.v_psp_info = tk.StringVar(value="")
         ttk.Label(pspf, textvariable=self.v_psp_info).pack(side="left", **pad)
 
@@ -374,7 +373,7 @@ class App:
                    self.tools["ffmpeg"] or "未找到"))
 
     def _scan_psp(self):
-        """扫描 USB 设备，找出带 PSP\\MUSIC 的盘"""
+        """扫描 USB 设备。找到就自动勾上「直接输出到该设备的 MUSIC 文件夹」。"""
         self.psp_devs = find_psp_devices()
         vals = [m for _d, m in self.psp_devs]
         self.cb_psp["values"] = vals
@@ -382,13 +381,22 @@ class App:
             if self.v_psp.get() not in vals:
                 self.cb_psp.set(vals[0])
             self.v_psp_info.set("检测到 %d 个 PSP 设备" % len(vals))
+            self._log("扫描 USB 设备：找到 %s" % "、".join(vals))
+            if not self._psp_user_off and not self.v_to_psp.get():
+                self.v_to_psp.set(True)
+                self._log("  → 已自动勾选「直接输出到该设备的 MUSIC 文件夹」")
         else:
             self.cb_psp.set("")
             self.v_psp_info.set("未检测到 —— 用 USB 线连上 PSP（或插记忆棒读卡器）后再刷新")
-        if self.v_to_psp.get():
-            self._toggle_psp()
-        self._log("扫描 USB 设备：%s" % ("、".join(vals) if vals
-                                        else "没找到带 PSP\\MUSIC 的盘"))
+            self._log("扫描 USB 设备：没找到带 PSP\\MUSIC 的盘")
+            if self.v_to_psp.get():
+                self.v_to_psp.set(False)     # 设备没了，别还占着输出目录
+        self._toggle_psp()
+
+    def _on_psp_check(self):
+        """用户手动点勾选框：记住这次选择，别被下次扫描的自动勾选覆盖"""
+        self._psp_user_off = not self.v_to_psp.get()
+        self._toggle_psp()
 
     def _toggle_psp(self):
         """勾选「直接输出到 PSP」时接管输出目录，取消勾选时还原"""
@@ -556,7 +564,8 @@ class App:
             return
 
         cwd = os.path.dirname(at3tool) or None
-        no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # 子进程都是控制台程序，不压掉的话每转一个文件就闪一下黑框
+        hidden = M.hidden_console_kwargs()
         self.q.put(("log", "中间文件目录：%s" % TMP_ROOT))
         warned_depth = False
 
@@ -619,8 +628,7 @@ class App:
                 cmd = [ffmpeg, "-v", "error", "-y", "-i", src_abs,
                        "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", tmp_wav]
                 self.q.put(("log", "   ffmpeg → 44100Hz/16bit/立体声 WAV"))
-                r = subprocess.run(cmd, capture_output=True, cwd=cwd,
-                                   creationflags=no_win)
+                r = subprocess.run(cmd, capture_output=True, cwd=cwd, **hidden)
                 if r.returncode != 0 or not os.path.isfile(tmp_wav):
                     err = (r.stderr or b"").decode("utf-8", "replace").strip()
                     self.q.put(("log", "[FAIL] %s：ffmpeg 转码失败 %s" % (name, err[:300])))
@@ -632,7 +640,7 @@ class App:
             # --- 2) at3tool 编码 ---
             self.q.put(("log", "   at3tool -e -br %s" % br))
             r = subprocess.run([at3tool, "-e", "-br", br, wav_path, at3_path],
-                               capture_output=True, cwd=cwd, creationflags=no_win)
+                               capture_output=True, cwd=cwd, **hidden)
             if r.returncode != 0 or not os.path.isfile(at3_path):
                 out = (r.stdout or b"").decode("utf-8", "replace").strip()
                 err = (r.stderr or b"").decode("utf-8", "replace").strip()

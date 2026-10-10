@@ -334,6 +334,30 @@ def find_cover_in_dir(audio_path):
     return None
 
 
+def hidden_console_kwargs():
+    """Windows 下让 ffmpeg / at3tool 这类控制台程序**不弹黑框**。
+
+    用法：subprocess.run(cmd, ..., **hidden_console_kwargs())
+    GUI 是 --windowed 的，本身没有控制台；子进程是 console 子系统程序，
+    Windows 会给它新建一个控制台窗口 —— 所以必须显式压掉。
+    """
+    if os.name != "nt":
+        return {}
+    import subprocess as _sp
+    kw = {}
+    flags = getattr(_sp, "CREATE_NO_WINDOW", 0)
+    if flags:
+        kw["creationflags"] = flags
+    try:
+        si = _sp.STARTUPINFO()
+        si.dwFlags |= getattr(_sp, "STARTF_USESHOWWINDOW", 0)
+        si.wShowWindow = 0          # SW_HIDE
+        kw["startupinfo"] = si
+    except Exception:
+        pass
+    return kw
+
+
 def find_ffmpeg():
     """在 exe 同目录 / bin / tools 子目录 / 单文件内置 / PATH 里找 ffmpeg.exe"""
     import shutil
@@ -398,7 +422,7 @@ def _ffmpeg_apic(path, ffmpeg):
         r = subprocess.run(
             [ffmpeg, "-v", "error", "-i", path, "-an",
              "-map", "0:v:0", "-c:v", "copy", "-f", "image2pipe", "-"],
-            capture_output=True, timeout=60)
+            capture_output=True, timeout=60, **hidden_console_kwargs())
     except Exception:
         return None
     if r.returncode != 0:
