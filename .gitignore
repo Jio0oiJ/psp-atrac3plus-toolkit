@@ -1,6 +1,7 @@
 # 白名单模式：默认全部忽略，只发布下面显式放行的文件
 /*
 !/.gitignore
+!/README.md
 !/at3_to_aa3.py
 !/atrac3plus_gui.py
 !/oma_header.bin
