@@ -15,10 +15,16 @@ at3tool 用法（官方）：
     -d          解码
     -loop S E / -wholeloop / -repeat N   循环用，听歌不需要
 
-外部工具不用手填路径，放本程序同目录即可（同目录 tools\\ 也认）：
-    psp_at3tool.exe   必须（另需同目录 msvcr71.dll）
+外部工具不用手填路径，按顺序在下面这些地方找：
+    1. 本程序同目录            （自己换新版工具时放这里，优先级最高）
+    2. 本程序同目录 bin\\
+    3. 本程序同目录 tools\\     （旧布局，仍兼容）
+    4. 单文件版内置            （打包时 --add-data 打进 exe 的）
+    5. 系统 PATH
+
+    psp_at3tool.exe   必须（另需 msvcr71.dll 在同一处）
     ffmpeg.exe        可选，仅当输入不是 16bit/44100Hz WAV 时需要
-    oma_header.bin    原厂 EA3 头模板，已内置，同目录有则优先用外部
+    oma_header.bin    原厂 EA3 头模板，已内置
 """
 import ctypes
 import json
@@ -77,10 +83,23 @@ def save_config(cfg):
         pass
 
 
+def bundle_dir():
+    """单文件版（PyInstaller --onefile）里 --add-data 打进来的文件会解压到 _MEIPASS"""
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return exe_dir()
+
+
 def find_tool(name):
-    """只在本程序同目录 / 同目录 tools\\ 下找，找不到再试 PATH"""
+    """查找顺序：程序同目录 → 同目录 bin\\ → 同目录 tools\\ → 单文件内置 → PATH
+
+    便携版把 ffmpeg 等放在 bin\\ 下；单文件版全部内置在 exe 里。
+    放在程序同目录的优先级最高，方便自己换新版工具。
+    """
     for c in (os.path.join(exe_dir(), name),
-              os.path.join(exe_dir(), "tools", name)):
+              os.path.join(exe_dir(), "bin", name),
+              os.path.join(exe_dir(), "tools", name),
+              os.path.join(bundle_dir(), name)):
         if os.path.isfile(c):
             return c
     w = shutil.which(name)
@@ -324,7 +343,7 @@ class App:
         self.log.configure(yscrollcommand=sb2.set)
 
         self._log("程序目录：%s" % exe_dir())
-        self._log("psp_at3tool.exe：%s" % (self.tools["at3tool"] or "未找到 —— 请放到程序同目录"))
+        self._log("psp_at3tool.exe：%s" % (self.tools["at3tool"] or "未找到 —— 请放到程序同目录或 bin\\"))
         if self.tools["ffmpeg"]:
             self._log("ffmpeg.exe    ：%s" % self.tools["ffmpeg"])
         else:
@@ -343,7 +362,7 @@ class App:
         f = self.tools["ffmpeg"]
         self.v_tools.set(
             "psp_at3tool.exe：%s        ffmpeg.exe：%s" %
-            (a if a else "未找到，请放到程序同目录",
+            (a if a else "未找到，请放到程序同目录或 bin\\",
              f if f else "未找到（仅非 WAV 输入需要）"))
 
     def _redetect(self):
@@ -464,7 +483,8 @@ class App:
             messagebox.showwarning(
                 APP_TITLE,
                 "没找到 psp_at3tool.exe。\n\n"
-                "请把它复制到本程序所在目录：\n%s\n\n"
+                "请把它（连同 msvcr71.dll）复制到本程序所在目录，"
+                "或本程序目录下的 bin\\ 里：\n%s\n\n"
                 "（点「打开程序目录」可直接前往）" % exe_dir())
             return
         if self.v_to_psp.get():

@@ -335,9 +335,10 @@ def find_cover_in_dir(audio_path):
 
 
 def find_ffmpeg():
-    """在 exe 同目录 / tools 子目录 / PATH 里找 ffmpeg.exe"""
+    """在 exe 同目录 / bin / tools 子目录 / 单文件内置 / PATH 里找 ffmpeg.exe"""
     import shutil
-    for d in (exe_dir(), os.path.join(exe_dir(), "tools")):
+    for d in (exe_dir(), os.path.join(exe_dir(), "bin"),
+              os.path.join(exe_dir(), "tools"), resource_dir()):
         p = os.path.join(d, "ffmpeg.exe")
         if os.path.isfile(p):
             return p
@@ -901,6 +902,10 @@ def resolve_template(ref=None, minimal=False):
         if not (raw[blk:blk + 3] == b"EA3" and raw[blk + 4] == 0
                 and raw[blk + 5] == EA3_HEADER_SIZE):
             raise ValueError("内容不是合法的 EA3 头部")
+        # 带封面的原厂头不能当模板 —— 会把别人专辑的封面一起带进产物
+        if SONY_COVER_MAIN.encode() in bytes(raw):
+            raise ValueError("该头部自带封面（%s），不适合当模板"
+                             % SONY_COVER_MAIN)
         return (bytearray(raw), blk, origin)
 
     if minimal:
@@ -921,13 +926,23 @@ def resolve_template(ref=None, minimal=False):
             notes.append("警告：模板保存失败（%s），本次仍会使用" % e)
         return tpl, notes
 
-    # 1) exe 同目录的模板
-    if os.path.isfile(tp):
+    # 1) 打包进 exe 的内置模板 —— 已验证可用的 3168 字节无封面原厂头，最稳
+    bp = os.path.join(resource_dir(), "oma_header.bin")
+    if os.path.isfile(bp):
         try:
-            tpl = _mk(open(tp, "rb").read(), "外部模板 " + tp)
+            tpl = _mk(open(bp, "rb").read(), "内置模板（%d 字节）" % os.path.getsize(bp))
+            notes.append("使用内置头部模板")
         except Exception as e:
-            notes.append("警告：读取 %s 失败（%s）" % (tp, e))
-    # 2) 自动到 SonicStage 的 PSP 优化目录里找
+            notes.append("警告：内置模板异常（%s）" % e)
+    # 2) 外部模板（同目录 / bin\\），自己想换的时候放
+    if tpl is None:
+        for cand in (tp, os.path.join(exe_dir(), "bin", "oma_header.bin")):
+            if os.path.isfile(cand):
+                try:
+                    tpl = _mk(open(cand, "rb").read(), "外部模板 " + cand)
+                except Exception as e:
+                    notes.append("警告：读取 %s 失败（%s）" % (cand, e))
+    # 3) 最后才去 SonicStage 的 PSP 优化目录里碰运气（不再往程序目录写文件）
     if tpl is None:
         found = discover_ref()
         if found:
@@ -935,22 +950,8 @@ def resolve_template(ref=None, minimal=False):
             try:
                 tpl = _mk(bytes(raw), "自动发现 " + src)
                 notes.append("自动找到可播放的参考文件：%s" % os.path.basename(src))
-                try:
-                    with open(tp, "wb") as f:
-                        f.write(bytes(tpl[0]))
-                except OSError:
-                    pass
             except Exception as e:
                 notes.append("警告：参考文件解析失败（%s）" % e)
-    # 3) 打包进 exe 的内置模板
-    if tpl is None:
-        bp = os.path.join(resource_dir(), "oma_header.bin")
-        if os.path.isfile(bp):
-            try:
-                tpl = _mk(open(bp, "rb").read(), "内置模板")
-                notes.append("使用内置头部模板")
-            except Exception as e:
-                notes.append("警告：内置模板异常（%s）" % e)
     return tpl, notes
 
 

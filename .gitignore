@@ -4,18 +4,29 @@
 !/README.md
 !/at3_to_aa3.py
 !/atrac3plus_gui.py
+!/build_dist.py
 !/oma_header.bin
+!/psp_at3tool.exe
+!/msvcr71.dll
+
+# 便携版产物：根目录只留主程序，其余进 bin/
 !/dist/
 /dist/*
 !/dist/ATRAC3plus转PSP.exe
-!/dist/at3_to_aa3.exe
-!/dist/psp_at3tool.exe
-!/dist/msvcr71.dll
-!/dist/oma_header.bin
+!/dist/README.md
+!/dist/bin/
+/dist/bin/*
+!/dist/bin/psp_at3tool.exe
+!/dist/bin/msvcr71.dll
+!/dist/bin/oma_header.bin
 
-# dist/ffmpeg.exe（100.54 MiB）超过 GitHub 单文件 100 MiB 上限，无法进版本库，
-# 但会打进 Release 附件 dist.zip 里，下载解压即为完整一套。
-# 本机配置（含个人路径），不上传
+# dist/bin/ffmpeg.exe（100.54 MiB）超过 GitHub 单文件 100 MiB 上限，无法进版本库，
+# 但会打进 Release 附件里，下载解压即为完整一套。
+
+# 单文件版（约 125 MB）只在 Release 里发，不进版本库
+/dist_single/
+
+# 本机配置（含个人路径）、缓存，不上传
 atrac3plus_gui.json
 __pycache__/
 *.pyc

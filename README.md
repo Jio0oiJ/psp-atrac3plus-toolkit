@@ -20,10 +20,10 @@
 
 ### GUI（推荐）
 
-1. 下载 Release 里的 `dist.zip`，解压（已包含 ffmpeg）。
+1. 下载 Release 里的单文件版 exe，或便携版 zip 解压（都自带 ffmpeg）。
 2. 运行 `ATRAC3plus转PSP.exe` → 添加文件或文件夹 → 码率选 352 → 开始。
 
-默认勾选「自动嵌入专辑封面」。工具不用配路径，程序自动在本程序同目录查找。
+默认勾选「自动嵌入专辑封面」。工具不用配路径，程序会自己去同目录 / `bin\` / exe 内置里找。
 
 **用「添加文件夹」时，输出会保留原来的目录结构**（含你添加的那个文件夹本身的名字）：
 
@@ -76,15 +76,14 @@ mp3 是程序自己解析的（不需要 ffmpeg）；flac / m4a / ogg / wma 等�
 
 ### 命令行
 
-已有 `.at3`、只想换头时：
+不再单独发布命令行 exe（GUI 已经涵盖全部功能）。有 Python 环境的话，
+已有 `.at3`、只想换头时可以这样：
 
 ```bash
-at3_to_aa3.exe song.at3          # 生成同名 .aa3，删除原文件
-at3_to_aa3.exe --keep song.at3   # 保留原 .at3
-at3_to_aa3.exe D:\music\at3\     # 整个文件夹递归
+python at3_to_aa3.py song.at3          # 生成同名 .aa3，删除原文件
+python at3_to_aa3.py --keep song.at3   # 保留原 .at3
+python at3_to_aa3.py D:\music\at3\     # 整个文件夹递归
 ```
-
-也可以直接把文件拖到 exe 图标上。
 
 封面相关（默认已自动开启，一般不用加）：
 
@@ -128,16 +127,52 @@ at3_to_aa3.exe D:\music\at3\     # 整个文件夹递归
 
 ## 下载
 
-[Releases](https://github.com/Jio0oiJ/psp-atrac3plus-toolkit/releases) 页面下载 `dist.zip`，解压即用。
+[Releases](https://github.com/Jio0oiJ/psp-atrac3plus-toolkit/releases) 页面，两种形态任选：
 
-包内 `ffmpeg.exe` 只在输入不是 16bit/44100Hz WAV 时才需要，用不到可以删。
+| 附件 | 形态 | 说明 |
+| --- | --- | --- |
+| `ATRAC3plus转PSP_单文件版.exe` | **一个文件走天下** | 约 57 MB。ffmpeg、at3tool、原厂头全打进 exe，双击即用，拷到哪都能跑。缺点是每次启动要把 100 MB 的 ffmpeg 解压到临时目录，首次启动慢几秒。 |
+| `ATRAC3plus转PSP_便携版.zip` | **主程序 + `bin\`** | 解压后根目录只有 `ATRAC3plus转PSP.exe`（21 MB），其余（主要是 `ffmpeg.exe`）都在 `bin\` 下，看着清爽。启动快。 |
+
+两个版本功能完全一样，区别只是 ffmpeg 放外面还是裹在里面。
+
+`ffmpeg.exe` 只在输入不是 16bit/44100Hz WAV 时才需要；如果你只用 WAV，便携版可以把 `bin\ffmpeg.exe` 删掉，单文件版没法拆。
+
+### 目录里只有主程序了吗？
+
+便携版解压后：
+
+```
+ATRAC3plus转PSP.exe      ← 主程序（at3tool / msvcr71.dll / 原厂头已内置）
+bin\ffmpeg.exe
+bin\psp_at3tool.exe
+bin\msvcr71.dll
+bin\oma_header.bin
+```
+
+`bin\` 里的三个小文件只是顺带留的副本（方便你自己换新版 at3tool），
+**删掉也不影响运行** —— exe 里已经内置了。
+
+工具查找顺序：程序同目录 → `bin\` → `tools\` → exe 内置 → 系统 PATH。
+想换自己的 ffmpeg/at3tool，直接丢在程序同目录即可，优先级最高。
 
 ## 源码编译
 
 ```bash
 pip install pyinstaller pillow
-pyinstaller --onefile --windowed --name "ATRAC3plus转PSP" --collect-all PIL --add-data "oma_header.bin;." atrac3plus_gui.py
-pyinstaller --onefile --console  --name at3_to_aa3        --collect-all PIL --add-data "oma_header.bin;." at3_to_aa3.py
+python build_dist.py        # 一次产出 dist\（便携版）和 dist_single\（单文件版）
+```
+
+不想用脚本的话，等价命令：
+
+```bash
+# 便携版
+pyinstaller --onefile --windowed --name "ATRAC3plus转PSP" --collect-all PIL ^
+  --add-data "oma_header.bin;." --add-data "psp_at3tool.exe;." --add-data "msvcr71.dll;." atrac3plus_gui.py
+# 单文件版：再多加一个 ffmpeg
+pyinstaller --onefile --windowed --name "ATRAC3plus转PSP" --collect-all PIL ^
+  --add-data "oma_header.bin;." --add-data "psp_at3tool.exe;." --add-data "msvcr71.dll;." ^
+  --add-data "tools\ffmpeg-9.0.2-essentials_build\bin\ffmpeg.exe;." atrac3plus_gui.py
 ```
 
 `psp_at3tool.exe` 为索尼（SCEI）PSP SDK 中的工具，随附仅为方便使用。
