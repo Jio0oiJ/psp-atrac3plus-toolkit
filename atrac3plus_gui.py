@@ -20,12 +20,15 @@ at3tool 用法（官方）：
     ffmpeg.exe        可选，仅当输入不是 16bit/44100Hz WAV 时需要
     oma_header.bin    原厂 EA3 头模板，已内置，同目录有则优先用外部
 """
+import ctypes
 import json
 import os
 import queue
 import shutil
+import string
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 import wave
@@ -92,6 +95,79 @@ def find_ffmpeg():
     return find_tool("ffmpeg.exe")
 
 
+# 中间文件（WAV / .at3）统一放这里，不落在输出目录里
+TMP_ROOT = os.path.join(tempfile.gettempdir(), "psp_atrac3plus_tmp")
+
+
+def tmp_workdir(idx):
+    """每个文件一个独立的临时子目录，避免同名文件互相覆盖。
+
+    注意文件名必须保持原样 —— convert_one 用 .at3 的文件名当曲目标题（TIT2），
+    所以不能用前缀序号去破坏它，只能靠子目录隔离。
+    """
+    d = os.path.join(TMP_ROOT, "f%d" % idx)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def list_drives():
+    """列出本机所有本地盘符（含 U 盘 / 读卡器）。"""
+    out = []
+    if os.name != "nt":
+        return out
+    try:
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        return out
+    for i, letter in enumerate(string.ascii_uppercase):
+        if not (mask >> i) & 1:
+            continue
+        path = letter + ":\\"
+        try:
+            t = ctypes.windll.kernel32.GetDriveTypeW(path)
+        except Exception:
+            continue
+        if t in (2, 3):            # 2 = 可移动（U盘/读卡器）, 3 = 本地硬盘
+            out.append(path)
+    return out
+
+
+def is_psp_music_dir(p):
+    """判断这个路径是不是「...\\PSP\\MUSIC」"""
+    p = os.path.abspath(p)
+    return (os.path.basename(p).upper() == "MUSIC"
+            and os.path.basename(os.path.dirname(p)).upper() == "PSP")
+
+
+def find_psp_devices():
+    """找出看起来是 PSP / 记忆棒的盘：根目录有 PSP 文件夹，且里面有 MUSIC。
+
+    返回 [(盘符, MUSIC 完整路径), ...]。个别卡把 MUSIC 直接放根目录，也认。
+    """
+    out = []
+    for d in list_drives():
+        try:
+            if not os.path.isdir(d):
+                continue
+            psp = os.path.join(d, "PSP")
+            music = ""
+            if os.path.isdir(psp):
+                for n in os.listdir(psp):
+                    if n.upper() == "MUSIC" and os.path.isdir(os.path.join(psp, n)):
+                        music = os.path.join(psp, n)
+                        break
+            if not music:
+                for n in os.listdir(d):
+                    if n.upper() == "MUSIC" and os.path.isdir(os.path.join(d, n)):
+                        music = os.path.join(d, n)
+                        break
+            if music:
+                out.append((d, music))
+        except OSError:
+            continue
+    return out
+
+
 def wav_is_ready(path):
     """是否已经是 at3tool 能直接吃的 16bit PCM WAV（44100Hz，1或2声道）"""
     try:
@@ -120,8 +196,15 @@ class App:
         self.q = queue.Queue()
         self.worker = None
         self.stop_flag = False
+        self.psp_devs = []
+        self._psp_active = False
+        self._last_outdir = ""
 
         self._build_ui()
+        self._scan_psp()
+        if self.cfg.get("to_psp") and self.psp_devs:
+            self.v_to_psp.set(True)
+            self._toggle_psp()
         self._poll()
 
     # ---------------- UI ----------------
@@ -183,7 +266,8 @@ class App:
             row=0, column=2, sticky="w")
 
         ttk.Label(opt, text="输出目录：").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(opt, textvariable=self.v_out).grid(row=1, column=1, sticky="ew", **pad)
+        self.en_out = ttk.Entry(opt, textvariable=self.v_out)
+        self.en_out.grid(row=1, column=1, sticky="ew", **pad)
         ttk.Button(opt, text="浏览", command=self._pick_outdir).grid(row=1, column=2, sticky="w", **pad)
         ttk.Label(opt, text="（留空 = 与源文件同目录；填写则保留原目录结构）").grid(
             row=1, column=3, sticky="w")
@@ -200,6 +284,22 @@ class App:
                         variable=self.v_del_src).grid(row=2, column=3, sticky="w", **pad)
         ttk.Checkbutton(opt, text="自动嵌入专辑封面（cover.jpg / 同名图片，PSP 可显示）",
                         variable=self.v_cover).grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+
+        # ---- 输出到 PSP（USB 大容量存储设备）----
+        pspf = ttk.LabelFrame(self.root, text="直接输出到 PSP（USB 设备）")
+        pspf.pack(fill="x", **pad)
+
+        self.v_psp = tk.StringVar()
+        self.cb_psp = ttk.Combobox(pspf, textvariable=self.v_psp, width=44,
+                                   state="readonly")
+        self.cb_psp.pack(side="left", **pad)
+        ttk.Button(pspf, text="刷新", command=self._scan_psp).pack(side="left", **pad)
+        self.v_to_psp = tk.BooleanVar(value=self.cfg.get("to_psp", False))
+        ttk.Checkbutton(pspf, text="直接输出到该设备的 MUSIC 文件夹",
+                        variable=self.v_to_psp,
+                        command=self._toggle_psp).pack(side="left", **pad)
+        self.v_psp_info = tk.StringVar(value="")
+        ttk.Label(pspf, textvariable=self.v_psp_info).pack(side="left", **pad)
 
         # ---- 运行 ----
         run = ttk.Frame(self.root)
@@ -253,6 +353,45 @@ class App:
         self._log("重新检测：psp_at3tool.exe=%s；ffmpeg.exe=%s" %
                   (self.tools["at3tool"] or "未找到",
                    self.tools["ffmpeg"] or "未找到"))
+
+    def _scan_psp(self):
+        """扫描 USB 设备，找出带 PSP\\MUSIC 的盘"""
+        self.psp_devs = find_psp_devices()
+        vals = [m for _d, m in self.psp_devs]
+        self.cb_psp["values"] = vals
+        if vals:
+            if self.v_psp.get() not in vals:
+                self.cb_psp.set(vals[0])
+            self.v_psp_info.set("检测到 %d 个 PSP 设备" % len(vals))
+        else:
+            self.cb_psp.set("")
+            self.v_psp_info.set("未检测到 —— 用 USB 线连上 PSP（或插记忆棒读卡器）后再刷新")
+        if self.v_to_psp.get():
+            self._toggle_psp()
+        self._log("扫描 USB 设备：%s" % ("、".join(vals) if vals
+                                        else "没找到带 PSP\\MUSIC 的盘"))
+
+    def _toggle_psp(self):
+        """勾选「直接输出到 PSP」时接管输出目录，取消勾选时还原"""
+        if self.v_to_psp.get():
+            m = self.v_psp.get().strip()
+            if not m:
+                self.v_to_psp.set(False)
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "没检测到 PSP 设备。\n\n"
+                    "请先用 USB 线把 PSP 连上电脑（或插记忆棒读卡器），再点「刷新」。")
+                return
+            if not getattr(self, "_psp_active", False):
+                self._last_outdir = self.v_out.get()
+            self.v_out.set(m)
+            self.en_out.configure(state="disabled")
+            self._psp_active = True
+        else:
+            self.en_out.configure(state="normal")
+            if getattr(self, "_psp_active", False):
+                self.v_out.set(getattr(self, "_last_outdir", ""))
+                self._psp_active = False
 
     def _open_exedir(self):
         os.startfile(exe_dir())
@@ -328,11 +467,21 @@ class App:
                 "请把它复制到本程序所在目录：\n%s\n\n"
                 "（点「打开程序目录」可直接前往）" % exe_dir())
             return
+        if self.v_to_psp.get():
+            m = self.v_psp.get().strip()
+            if not m or not os.path.isdir(m):
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "选中的 PSP 设备现在访问不了：\n%s\n\n"
+                    "请确认还连着，然后点「刷新」重新检测。" % (m or "(未选择)"))
+                return
         # 保存配置
-        self.cfg.update({"outdir": self.v_out.get(), "bitrate": self.v_br.get(),
+        self.cfg.update({"outdir": self._last_outdir or self.v_out.get(),
+                         "bitrate": self.v_br.get(),
                          "keep_at3": self.v_keep_at3.get(),
                          "keep_wav": self.v_keep_wav.get(),
-                         "cover": self.v_cover.get()})
+                         "cover": self.v_cover.get(),
+                         "to_psp": self.v_to_psp.get()})
         save_config(self.cfg)
 
         self.stop_flag = False
@@ -388,8 +537,10 @@ class App:
 
         cwd = os.path.dirname(at3tool) or None
         no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self.q.put(("log", "中间文件目录：%s" % TMP_ROOT))
+        warned_depth = False
 
-        for src in list(self.files):
+        for idx, src in enumerate(list(self.files)):
             if self.stop_flag:
                 self.q.put(("log", "已停止"))
                 break
@@ -406,6 +557,12 @@ class App:
                 dst_dir = os.path.normpath(os.path.join(outdir, rel))
                 disp = os.path.normpath(os.path.relpath(
                     src_abs, os.path.dirname(root)))
+                # PSP 的 PSP/MUSIC 下面只认一层子目录，两层很可能扫不到
+                if (not warned_depth and os.sep in rel
+                        and is_psp_music_dir(outdir)):
+                    self.q.put(("log", "   ⚠ 注意：PSP 的 MUSIC 下只认一层子目录，"
+                                       "「%s」是两层，PSP 可能扫不到" % rel))
+                    warned_depth = True
             elif outdir:
                 dst_dir = outdir
                 disp = name
@@ -420,10 +577,14 @@ class App:
                 continue
 
             self.q.put(("log", "── %s" % disp))
+            # 中间文件（WAV / .at3）一律放临时目录，不落在输出目录里。
+            # 每个文件一个子目录，文件名保持原样 —— convert_one 拿 .at3 的
+            # 文件名当曲目标题，不能加前缀破坏它。
             # 必须绝对路径：子进程 cwd 会被设成 at3tool 所在目录（找 msvcr71.dll），
             # 相对路径会被解析到那里去
-            tmp_wav = os.path.abspath(os.path.join(dst_dir, base + "__pcm.wav"))
-            at3_path = os.path.abspath(os.path.join(dst_dir, base + ".at3"))
+            work = tmp_workdir(idx)
+            tmp_wav = os.path.abspath(os.path.join(work, base + "__pcm.wav"))
+            at3_path = os.path.abspath(os.path.join(work, base + ".at3"))
 
             # --- 1) 准备 16bit PCM WAV ---
             if wav_is_ready(src_abs):
@@ -456,7 +617,7 @@ class App:
                 out = (r.stdout or b"").decode("utf-8", "replace").strip()
                 err = (r.stderr or b"").decode("utf-8", "replace").strip()
                 self.q.put(("log", "[FAIL] %s：at3tool 失败 %s %s" % (name, out[:200], err[:200])))
-                self._cleanup(tmp_wav, keep_wav)
+                self._cleanup(tmp_wav, keep_wav, work, keep_at3)
                 fail += 1
                 continue
             self.q.put(("step", None))
@@ -480,13 +641,27 @@ class App:
                         os.remove(at3_path)
                 except OSError:
                     pass
-                self._cleanup(tmp_wav, keep_wav)
+                self._cleanup(tmp_wav, keep_wav, work, keep_at3)
                 fail += 1
                 continue
             self.q.put(("log", "[OK]   %s" % msg))
             self.q.put(("step", None))
 
-            self._cleanup(tmp_wav, keep_wav)
+            # convert_one 把 .aa3 写在输入 .at3 旁边，也就是 tmp 的工作目录里。
+            # 必须搬到真正的输出目录 —— 否则下一步清 tmp 会把成品一起删掉。
+            final = os.path.join(dst_dir, base + ".aa3")
+            if os.path.isfile(dst) and os.path.abspath(dst) != os.path.abspath(final):
+                try:
+                    shutil.move(dst, final)
+                    dst = final
+                except OSError as e:
+                    self.q.put(("log", "[FAIL] %s：无法移到输出目录 %s (%s)"
+                                % (name, dst_dir, e)))
+                    self._cleanup(tmp_wav, keep_wav, work, keep_at3)
+                    fail += 1
+                    continue
+
+            self._cleanup(tmp_wav, keep_wav, work, keep_at3)
             if del_src and os.path.abspath(src) != os.path.abspath(at3_path):
                 try:
                     os.remove(src)
@@ -497,10 +672,14 @@ class App:
 
         self.q.put(("log", "=" * 60))
         self.q.put(("log", "完成：成功 %d，失败 %d" % (ok, fail)))
-        self.q.put(("log", "把 .aa3 拷到记忆棒 PSP/MUSIC/ 下即可播放"))
+        if outdir and is_psp_music_dir(outdir):
+            self.q.put(("log", "已直接写进 PSP 的 MUSIC 文件夹，拔掉 USB 线即可播放"))
+        else:
+            self.q.put(("log", "把 .aa3 拷到记忆棒 PSP/MUSIC/ 下即可播放"))
         self.q.put(("done", "完成：成功 %d，失败 %d" % (ok, fail)))
 
-    def _cleanup(self, path, keep):
+    def _cleanup(self, path, keep, work=None, keep_dir=False):
+        """删掉中间文件；顺带把 TMP_ROOT 下那个临时子目录一起清掉。"""
         if keep:
             return
         try:
@@ -508,6 +687,8 @@ class App:
                 os.remove(path)
         except OSError:
             pass
+        if work and not keep_dir:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
