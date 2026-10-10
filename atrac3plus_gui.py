@@ -435,9 +435,11 @@ class App:
             self.q.put(("step", None))
 
             # --- 3) 换头 → .aa3 ---
-            cover = M.find_cover_for(src_abs) if want_cover else None
+            # 先找输出目录 / 源目录里的图片，找不到就从原始音频的内嵌封面里抠
+            cover = (M.find_cover_for(at3_path, src_abs, ffmpeg=ffmpeg)
+                     if want_cover else None)
             if cover:
-                self.q.put(("log", "   封面：%s" % os.path.basename(cover)))
+                self.q.put(("log", "   封面：%s" % M.cover_label(cover)))
             try:
                 good, dst, msg = M.convert_one(at3_path, keep=keep_at3,
                                                tag=True, tpl=tpl, cover=cover)

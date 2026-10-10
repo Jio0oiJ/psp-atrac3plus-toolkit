@@ -27,14 +27,21 @@
 
 ### 封面怎么放
 
-转换时会按下面顺序找图片，找到就内嵌（自动缩到 640×640 并转成 JPEG）：
+其实大多数情况什么都不用做 —— 转换时会按下面顺序找封面，找到就内嵌
+（自动缩到 640×640 并转成 JPEG）：
 
 1. 与音频同名的图片，如 `01. Fallen Embers.mp3` → `01. Fallen Embers.jpg`
 2. 同目录下的 `cover.jpg` / `cover.jpeg` / `cover.png` / `cover.bmp` /
    `folder.jpg` / `album.jpg` / `front.jpg` / `artwork.jpg`
 3. 同目录下唯一的那个图片文件
+4. **原始音频自己内嵌的封面** —— mp3 的 ID3v2 APIC、flac 的 picture block、
+   m4a 的 covr 等，直接抠出来用
 
-整张专辑用一张封面时，往文件夹里丢一个 `cover.jpg` 就够了。
+第 4 步意味着：直接用带封面的 mp3/flac/m4a 转就行，不用另外准备图片文件。
+mp3 是程序自己解析的（不需要 ffmpeg）；flac / m4a / ogg / wma 等会调用
+同目录的 `ffmpeg.exe` 来抠。
+
+整张专辑想统一用一张外部封面时，往文件夹里丢一个 `cover.jpg`，它会优先于内嵌封面。
 
 ### 命令行
 

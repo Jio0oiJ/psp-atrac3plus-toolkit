@@ -64,6 +64,15 @@ SONY_BKLSI = "OMG_BKLSI"
 COVER_NAMES = ("cover.jpg", "cover.jpeg", "cover.png", "cover.bmp",
                "folder.jpg", "folder.jpeg", "album.jpg", "front.jpg",
                "artwork.jpg")
+# 同目录里没有图片时，去这些音频文件的**内嵌封面**里抠（按此顺序）
+AUDIO_EXTS = (".mp3", ".flac", ".m4a", ".mp4", ".aac", ".ogg", ".opus",
+              ".wma", ".ape", ".wav", ".aiff")
+# 常见图片格式的魔数，用于判断抠出来的到底是不是图
+_IMG_MAGIC = (b"\xff\xd8\xff",            # JPEG
+              b"\x89PNG\r\n\x1a\n",       # PNG
+              b"BM",                      # BMP
+              b"GIF87a", b"GIF89a",       # GIF
+              b"II*\x00", b"MM\x00*")     # TIFF
 
 
 def parse_riff_at3(d):
@@ -294,7 +303,7 @@ def find_frames(tag, end):
     return out
 
 
-def find_cover_for(audio_path):
+def find_cover_in_dir(audio_path):
     """给一个音频文件在同目录里找封面图：先试同名图片，再试 cover.jpg 之类。"""
     d = os.path.dirname(os.path.abspath(audio_path))
     base = os.path.splitext(os.path.basename(audio_path))[0]
@@ -317,13 +326,146 @@ def find_cover_for(audio_path):
     return None
 
 
+def find_ffmpeg():
+    """在 exe 同目录 / tools 子目录 / PATH 里找 ffmpeg.exe"""
+    import shutil
+    for d in (exe_dir(), os.path.join(exe_dir(), "tools")):
+        p = os.path.join(d, "ffmpeg.exe")
+        if os.path.isfile(p):
+            return p
+    return shutil.which("ffmpeg")
+
+
+def _id3v2_apic(path):
+    """直接解析 ID3v2 标签里的 APIC 帧（mp3 最常用，不需要任何外部工具）。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+            if head[:3] != b"ID3":
+                return None
+            size = ((head[6] & 0x7F) << 21) | ((head[7] & 0x7F) << 14) | \
+                   ((head[8] & 0x7F) << 7) | (head[9] & 0x7F)
+            tag = bytearray(head + f.read(size))
+    except OSError:
+        return None
+    first = None
+    for fid, _hoff, doff, sz in find_frames(tag, len(tag)):
+        if fid != b"APIC":
+            continue
+        b = bytes(tag[doff:doff + sz])
+        if len(b) < 4:
+            continue
+        enc, i = b[0], 1
+        j = b.find(b"\x00", i)
+        if j < 0:
+            continue
+        i = j + 1                      # 跳过 mime
+        if i >= len(b):
+            continue
+        ptype = b[i]
+        i += 1                         # 跳过 picture type
+        if enc in (1, 2):              # UTF-16（带不带 BOM），结束符两个字节
+            k = i
+            while k + 1 < len(b) and not (b[k] == 0 and b[k + 1] == 0):
+                k += 2
+            i = k + 2
+        else:                          # ISO-8859-1 / UTF-8，结束符一个字节
+            k = b.find(b"\x00", i)
+            i = (k + 1) if k >= 0 else len(b)
+        img = b[i:]
+        if not img:
+            continue
+        if ptype == COVER_PTYPE:       # 优先「封面(front cover)」
+            return img
+        if first is None:
+            first = img
+    return first
+
+
+def _ffmpeg_apic(path, ffmpeg):
+    """用 ffmpeg 抠内嵌封面（flac / m4a / ogg / wma 等，ID3v2 解析不到的靠它）。"""
+    import subprocess
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", path, "-an",
+             "-map", "0:v:0", "-c:v", "copy", "-f", "image2pipe", "-"],
+            capture_output=True, timeout=60)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout or None
+
+
+def extract_embedded_cover(path, ffmpeg=None):
+    """从音频文件内嵌的封面里抠图。返回图片字节，没有则返回 None。
+
+    先自己解析 ID3v2 APIC（mp3，零依赖、快），不行再叫 ffmpeg。
+    """
+    if not os.path.isfile(path):
+        return None
+    data = _id3v2_apic(path)
+    if not data and ffmpeg and os.path.isfile(ffmpeg):
+        data = _ffmpeg_apic(path, ffmpeg)
+    if data and data.startswith(_IMG_MAGIC):
+        return data
+    return None
+
+
+def find_cover_for(*paths, **kw):
+    """按优先级找封面，返回 **图片路径(str)** 或 **图片字节(bytes)**，没有则 None。
+
+    顺序：
+      1. 每个 path 同目录里的图片（同名图 → cover.jpg 之类 → 目录里唯一的图）
+      2. 每个 path 本身 / 同目录同名音频 的**内嵌封面**
+
+    返回 bytes 时表示是从音频里抠出来的，调用方直接用即可。
+    kw: embed=False 关闭第 2 步，ffmpeg=<路径> 指定 ffmpeg。
+    """
+    embed = kw.get("embed", True)
+    ffmpeg = kw.get("ffmpeg", None)
+    for p in paths:
+        c = find_cover_in_dir(p)
+        if c:
+            return c
+    if not embed:
+        return None
+
+    cands = []
+    for p in paths:
+        ap = os.path.abspath(p)
+        cands.append(ap)
+        d, base = os.path.dirname(ap), os.path.splitext(os.path.basename(ap))[0]
+        cands += [os.path.join(d, base + e) for e in AUDIO_EXTS]
+    seen = set()
+    for c in cands:
+        cl = c.lower()
+        if cl in seen:
+            continue
+        seen.add(cl)
+        # 只对真正的音频格式动用 ffmpeg（否则对 .at3 白起一堆子进程）
+        ext = os.path.splitext(c)[1].lower()
+        data = extract_embedded_cover(c, ffmpeg if ext in AUDIO_EXTS else None)
+        if data:
+            return data
+    return None
+
+
+def cover_label(cover):
+    """给日志用的封面来源说明（可能是路径，也可能是抠出来的字节）"""
+    if isinstance(cover, (bytes, bytearray)):
+        return "从音频内嵌提取（%d 字节）" % len(cover)
+    return os.path.basename(cover)
+
+
 def load_cover_bytes(path, max_side=COVER_MAX_SIDE, max_bytes=COVER_MAX_BYTES):
     """读入图片 → RGB → 缩到 max_side → 压成 JPEG，控制在 max_bytes 以内。
+    参数可以是**文件路径**，也可以是**图片字节**（从音频里抠出来的那种）。
     没有 Pillow 时退化：只接受已经是 JPEG 且体积合规的图片，原样嵌入。"""
+    raw = path if isinstance(path, (bytes, bytearray)) else open(path, "rb").read()
     try:
         from PIL import Image
     except ImportError:
-        raw = open(path, "rb").read()
         if raw[:2] != b"\xff\xd8":
             raise RuntimeError("未安装 Pillow，只能直接嵌入 JPEG；"
                                "请把封面转成 .jpg（或 pip install Pillow）")
@@ -331,7 +473,7 @@ def load_cover_bytes(path, max_side=COVER_MAX_SIDE, max_bytes=COVER_MAX_BYTES):
             raise RuntimeError("未安装 Pillow，无法压缩；封面 %d 字节超过 %d 上限"
                                % (len(raw), max_bytes))
         return raw, COVER_MIME
-    im = Image.open(path)
+    im = Image.open(io.BytesIO(bytes(raw)))
     im = im.convert("RGB")
     if max(im.size) > max_side:
         im.thumbnail((max_side, max_side), Image.LANCZOS)
@@ -596,7 +738,7 @@ def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
                 apic=True):
     """转换单个文件。返回 (成功与否, 输出路径或 None, 信息字符串)
 
-    cover  : 封面图片路径，或已压好的 JPEG 字节，或 None
+    cover  : 封面图片路径，或图片原始字节（如从音频内嵌抠出来的），或 None
     apic   : 除索尼 GEOB 外，是否再写一个标准 APIC 帧（默认开，PSP 靠它显示）
     pad_to : 把头部补到该长度（调试用，None = 自然变长）
     """
@@ -644,14 +786,12 @@ def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
     # ---- 封面 ----
     cover_note = ""
     if cover is not None:
-        if isinstance(cover, bytes):
-            cover_bytes = cover
-        else:
-            try:
-                cover_bytes, _mime = load_cover_bytes(cover)
-            except Exception as e:
-                return False, None, "%s：封面处理失败（%s）" % (
-                    os.path.basename(src), e)
+        # cover 可能是图片路径，也可能是从音频内嵌抠出来的原始字节（png/jpeg 都行）
+        try:
+            cover_bytes, _mime = load_cover_bytes(cover)
+        except Exception as e:
+            return False, None, "%s：封面处理失败（%s）" % (
+                os.path.basename(src), e)
         cover_note = " | 封面 %d 字节" % len(cover_bytes)
     else:
         cover_bytes = None
@@ -874,7 +1014,8 @@ def main():
         print("        --minimal         不用模板，生成最小头（PSP 通常不认）")
         print("        --ref <file.oma>  指定参考文件并保存为模板")
         print("        --cover [图片]    内嵌专辑封面（默认自动找同目录 cover.jpg /")
-        print("                          同名图片 / 目录里唯一的图片）")
+        print("                          同名图片 / 目录里唯一的图片；")
+        print("                          都找不到就从音频的内嵌封面里抠）")
         print("        --no-cover        不找封面")
         print("        --no-apic         只写索尼 GEOB，不写标准 APIC")
         print("                          （默认写 —— PSP 显示封面靠 APIC，实测只写")
@@ -905,12 +1046,13 @@ def main():
     print("头部来源：%s" % (("移植原厂头部 —— " + tpl[2]) if tpl else
                            "最小合成头 —— PSP 不认，请用 --ref 指定一个能播的 .oma"))
     print("-" * 62)
+    ff = find_ffmpeg()
     for src in files:
         c = cover
         if cover == "auto":
-            c = find_cover_for(src)
+            c = find_cover_for(src, ffmpeg=ff)
             if c:
-                print("   封面：%s" % os.path.basename(c))
+                print("   封面：%s" % cover_label(c))
         try:
             good, dst, msg = convert_one(src, keep, tag, tpl,
                                          cover=c, pad_to=pad_to, apic=apic)
