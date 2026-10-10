@@ -19,6 +19,7 @@ at3 → aa3 换壳器（支持拖拽多个文件）
 EA3 头部各字节的取值依据 ffmpeg 的 OMA 复用器 libavformat/omaenc.c
 （oma_write_header）与解复用器 omadec.c 的校验逻辑，非猜测。
 """
+import io
 import os
 import struct
 import sys
@@ -45,6 +46,24 @@ FRAME_TO_KBPS = {
 }
 
 HEADER_TOTAL = ID3V2_HEADER_SIZE + EA3_HEADER_SIZE   # 106
+
+# ---- 专辑封面 ----
+# 索尼不用标准 APIC，而是塞进两个 **GEOB** 帧（实测自 SonicStage 转出的 .OMA）：
+#   OMG_FENCA1  主封面   image/jpeg
+#   OMG_TDFCA   缩略图位 image/jpeg —— 索尼实测填的是**同一张图**（md5 一致）
+# 规格：640x640、约 73KB，写两份 → 头部从 3168 涨到约 150624 字节。
+# 全部 8 首同专辑的曲子共用同一张图，md5 完全相同。
+COVER_MAX_SIDE = 640
+COVER_MAX_BYTES = 80 * 1024
+COVER_MIME = "image/jpeg"
+COVER_PTYPE = 3          # ID3v2 APIC picture type: $03 = 封面(front cover)
+SONY_COVER_MAIN = "OMG_FENCA1"
+SONY_COVER_THUMB = "OMG_TDFCA"
+SONY_BKLSI = "OMG_BKLSI"
+# 自动查找时的候选文件名（小写比较）
+COVER_NAMES = ("cover.jpg", "cover.jpeg", "cover.png", "cover.bmp",
+               "folder.jpg", "folder.jpeg", "album.jpg", "front.jpg",
+               "artwork.jpg")
 
 
 def parse_riff_at3(d):
@@ -150,6 +169,10 @@ def validate_ea3(blob, channels, sample_rate, block_align):
     if blk + EA3_HEADER_SIZE > len(blob):
         bad.append("EA3 块超出文件范围")
         return bad
+
+    # 标签体里必须能解析出帧；解析不出来通常意味着拼头时把 10 字节头写了两遍
+    if not find_frames(bytearray(blob[:blk]), blk):
+        bad.append("ID3v2 标签体里解析不出任何帧（检查是否重复写了标签头）")
 
     # --- EA3 块（oma_read_header）---
     if blob[blk:blk + 3] != b"EA3":
@@ -271,6 +294,156 @@ def find_frames(tag, end):
     return out
 
 
+def find_cover_for(audio_path):
+    """给一个音频文件在同目录里找封面图：先试同名图片，再试 cover.jpg 之类。"""
+    d = os.path.dirname(os.path.abspath(audio_path))
+    base = os.path.splitext(os.path.basename(audio_path))[0]
+    cands = [os.path.join(d, base + e) for e in
+             (".jpg", ".jpeg", ".png", ".bmp")]
+    cands += [os.path.join(d, n) for n in COVER_NAMES]
+    try:
+        names = {n.lower(): n for n in os.listdir(d)}
+    except OSError:
+        return None
+    for c in cands:
+        n = os.path.basename(c).lower()
+        if n in names:
+            return os.path.join(d, names[n])
+    # 目录里只有一张图片时也认（单曲自提取封面的常见情况）
+    imgs = [n for n in names.values()
+            if n.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))]
+    if len(imgs) == 1:
+        return os.path.join(d, imgs[0])
+    return None
+
+
+def load_cover_bytes(path, max_side=COVER_MAX_SIDE, max_bytes=COVER_MAX_BYTES):
+    """读入图片 → RGB → 缩到 max_side → 压成 JPEG，控制在 max_bytes 以内。
+    没有 Pillow 时退化：只接受已经是 JPEG 且体积合规的图片，原样嵌入。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        raw = open(path, "rb").read()
+        if raw[:2] != b"\xff\xd8":
+            raise RuntimeError("未安装 Pillow，只能直接嵌入 JPEG；"
+                               "请把封面转成 .jpg（或 pip install Pillow）")
+        if len(raw) > max_bytes:
+            raise RuntimeError("未安装 Pillow，无法压缩；封面 %d 字节超过 %d 上限"
+                               % (len(raw), max_bytes))
+        return raw, COVER_MIME
+    im = Image.open(path)
+    im = im.convert("RGB")
+    if max(im.size) > max_side:
+        im.thumbnail((max_side, max_side), Image.LANCZOS)
+    q = 88
+    while True:
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=q, optimize=True, progressive=False)
+        data = buf.getvalue()
+        if len(data) <= max_bytes or q <= 45:
+            return data, COVER_MIME
+        q -= 8
+
+
+def build_apic(data, mime=COVER_MIME, ptype=COVER_PTYPE, desc=""):
+    """标准 ID3v2.3 APIC 帧。索尼原厂文件里没有它，但 **PSP 靠它显示封面**。"""
+    body = (b"\x00" +                       # text encoding: $00 = ISO-8859-1
+            mime.encode("ascii") + b"\x00" +
+            bytes([ptype]) +
+            desc.encode("latin-1", "replace") + b"\x00" +
+            data)
+    return (b"APIC" + struct.pack(">I", len(body)) + b"\x00\x00" + body)
+
+
+def build_geob(obj, desc, mime=COVER_MIME, enc=2):
+    """索尼风格的 GEOB 帧。
+
+    enc=2 表示后面的 filename / description 是 UTF-16BE（无 BOM），
+    结束符是 0x00 0x00 两个字节。原厂文件里 filename 是空串。
+    """
+    body = (bytes([enc]) +
+            mime.encode("ascii") + b"\x00" +      # MIME 永远是单字节 + 0x00
+            b"\x00\x00" +                          # filename：UTF-16BE 空串
+            desc.encode("utf-16-be") + b"\x00\x00" +
+            obj)
+    return b"GEOB" + struct.pack(">I", len(body)) + b"\x00\x00" + body
+
+
+def build_cover_frames(jpeg, apic=True):
+    """封面帧组合。
+
+    索尼格式 = 两个 GEOB（主图 OMG_FENCA1 + 缩略图位 OMG_TDFCA，索尼填同一张），
+    索尼自家软件（SonicStage / Walkman）读这个。
+
+    apic=True 时再补一个标准 APIC 帧 —— **PSP 音乐播放器读的是 APIC**。
+    真机对照实验：只写 GEOB×2 → PSP 不显示封面；GEOB×2 + APIC → PSP 显示封面。
+    所以 apic 默认开。"""
+    out = (build_geob(jpeg, SONY_COVER_MAIN) +
+           build_geob(jpeg, SONY_COVER_THUMB))
+    if apic:
+        out += build_apic(jpeg)
+    return out
+
+
+def _geob_desc(tag, doff, size):
+    """取 GEOB 的 description（UTF-16BE）"""
+    b = bytes(tag[doff:doff + size])
+    if len(b) < 3 or b[0] not in (1, 2):
+        return ""
+    i = 1
+    j = b.find(b"\x00", i)
+    if j < 0:
+        return ""
+    i = j + 1
+    if b[i:i + 2] == b"\x00\x00":      # 空 filename
+        i += 2
+    else:
+        k = i
+        while k + 1 < len(b) and not (b[k] == 0 and b[k + 1] == 0):
+            k += 2
+        i = k + 2
+    k = i
+    while k + 1 < len(b) and not (b[k] == 0 and b[k + 1] == 0):
+        k += 2
+    return b[i:k].decode("utf-16-be", "replace")
+
+
+def insert_frames(hdr, blk, blob, after_desc=None, pad_to=None):
+    """把若干帧插进 ID3v2 标签，重建头部。
+
+    hdr  = [ID3v2 标签][EA3 96B]，blk = EA3 块起始 = ID3v2 标签总长
+    blob = 要插入的一串完整帧
+    after_desc = 插在 description 为该值的 GEOB 之后（复刻原厂的帧顺序），
+                 不给则追加到最后一帧之后
+    pad_to = 把整个头部补到该长度（排查 PSP 是否容忍头部变长）
+    返回 (新头部 bytes, 新的 blk)
+    """
+    tag = bytearray(hdr[:blk])
+    ea3 = bytes(hdr[blk:blk + EA3_HEADER_SIZE])
+    frames = find_frames(tag, blk)
+    if not frames:
+        raise RuntimeError("模板标签里解析不出帧，无法插入封面")
+
+    cut = frames[-1][1] + 10 + frames[-1][3]      # 默认追加到末尾
+    if after_desc:
+        for fid, hoff, doff, size in frames:
+            if fid == b"GEOB" and _geob_desc(tag, doff, size) == after_desc:
+                cut = hoff + 10 + size
+                break
+
+    # tag 含 10 字节 ID3v2 头，帧体要从 ID3V2_HEADER_SIZE 开始取，
+    # 否则新旧头会被拼在一起，标签里出现两个头
+    body = bytes(tag[ID3V2_HEADER_SIZE:cut]) + blob + bytes(tag[cut:blk])
+    if pad_to is not None:
+        total = ID3V2_HEADER_SIZE + len(body) + EA3_HEADER_SIZE
+        if total > pad_to:
+            raise RuntimeError("内容太大：头部需要 %d 字节，超过 pad_to=%d"
+                               % (total, pad_to))
+        body += b"\x00" * (pad_to - total)
+    new = (ID3V2_EA3_MAGIC + bytes([3, 0]) + b"\x00" + synchsafe(len(body)))
+    return bytes(new) + body + ea3, ID3V2_HEADER_SIZE + len(body)
+
+
 def frame_desc(tag, doff, size):
     """取 TXXX 之类的 description 文本，返回 (描述字符串, 值起始偏移)"""
     enc = tag[doff]
@@ -386,8 +559,15 @@ def discover_ref():
 
 
 def build_from_template(tpl, blk, codec_id, channels, sample_rate,
-                        block_align, frames, title, duration_s):
-    """在原厂头部基础上改参数，返回 (bytes, params)"""
+                        block_align, frames, title, duration_s,
+                        cover=None, pad_to=None, apic=True):
+    """在原厂头部基础上改参数，返回 (bytes, params)
+
+    cover  : 已压好的 JPEG 字节，写成 GEOB×2（+ APIC）
+    apic   : 是否额外写标准 APIC 帧。默认开 —— PSP 显示封面靠它
+             （真机实测：只写 GEOB×2 不显示，加上 APIC 才显示）
+    pad_to : 把整个头部补到这个长度（None = 随封面自然变长）
+    """
     hdr = bytearray(tpl)
     srate_index = OMA_SRATE_TAB.index(sample_rate // 100)
     params = ((codec_id << 24) | (srate_index << 13) |
@@ -398,11 +578,28 @@ def build_from_template(tpl, blk, codec_id, channels, sample_rate,
         patch_frame(hdr, b"TXXX", title, want_desc="OMG_TIT2S")
     if duration_s:
         patch_frame(hdr, b"TLEN", str(int(round(duration_s * 1000))))
+    if cover:
+        # 索尼原厂的帧顺序是 … GEOB(OMG_BKLSI) GEOB(OMG_FENCA1)
+        # GEOB(OMG_OLINF) GEOB(OMG_TDFCA)，这里照抄：
+        # 主封面紧跟 OMG_BKLSI，缩略图放在最后。
+        main_f = build_geob(cover, SONY_COVER_MAIN)
+        thumb_f = build_geob(cover, SONY_COVER_THUMB) + (
+            build_apic(cover) if apic else b"")
+        # 插帧会改变标签长度 → blk（EA3 块偏移）也随之改变
+        newhdr, blk = insert_frames(hdr, blk, main_f, after_desc=SONY_BKLSI)
+        newhdr, blk = insert_frames(newhdr, blk, thumb_f, pad_to=pad_to)
+        return newhdr + frames, params
     return bytes(hdr) + frames, params
 
 
-def convert_one(src, keep=False, tag=False, tpl=None):
-    """转换单个文件。返回 (成功与否, 输出路径或 None, 信息字符串)"""
+def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
+                apic=True):
+    """转换单个文件。返回 (成功与否, 输出路径或 None, 信息字符串)
+
+    cover  : 封面图片路径，或已压好的 JPEG 字节，或 None
+    apic   : 除索尼 GEOB 外，是否再写一个标准 APIC 帧（默认开，PSP 靠它显示）
+    pad_to : 把头部补到该长度（调试用，None = 自然变长）
+    """
     if not os.path.isfile(src):
         return False, None, "文件不存在：%s" % src
     ext = os.path.splitext(src)[1].lower()
@@ -443,12 +640,29 @@ def convert_one(src, keep=False, tag=False, tpl=None):
     frames = d[data_off:data_off + data_size]
     title = os.path.splitext(os.path.basename(src))[0] if tag else None
     nframes0 = data_size // fmt["block_align"]
+
+    # ---- 封面 ----
+    cover_note = ""
+    if cover is not None:
+        if isinstance(cover, bytes):
+            cover_bytes = cover
+        else:
+            try:
+                cover_bytes, _mime = load_cover_bytes(cover)
+            except Exception as e:
+                return False, None, "%s：封面处理失败（%s）" % (
+                    os.path.basename(src), e)
+        cover_note = " | 封面 %d 字节" % len(cover_bytes)
+    else:
+        cover_bytes = None
+
     if tpl:
         hdr, blk = tpl[0], tpl[1]
         blob, params = build_from_template(
             hdr, blk, codec_id, fmt["channels"], fmt["sample_rate"],
             fmt["block_align"], frames, title,
-            nframes0 * 2048 / fmt["sample_rate"])
+            nframes0 * 2048 / fmt["sample_rate"],
+            cover=cover_bytes, pad_to=pad_to, apic=apic)
     else:
         blob, params = build_ea3(codec_id, fmt["channels"], fmt["sample_rate"],
                                  fmt["block_align"], frames, title)
@@ -487,8 +701,9 @@ def convert_one(src, keep=False, tag=False, tpl=None):
 
     msg = ("%s → %s | %s %dHz %dch 帧长%d(%.0fkbps) | %d帧 %.1fs | params=0x%06X"
            % (os.path.basename(src), os.path.basename(dst), codec_name,
-              fmt["sample_rate"], fmt["channels"], fmt["block_align"], kbps,
+              fmt["sample_rate"], fmt["channels"],               fmt["block_align"], kbps,
               nframes, dur, params & 0xFFFFFF))
+    msg += cover_note
     if fmt["sample_rate"] != 44100:
         msg += "\n       ⚠ PSP 音乐播放器要 44100Hz，当前 %dHz，可能被判损坏" % fmt["sample_rate"]
     if fmt["channels"] not in (1, 2):
@@ -582,14 +797,39 @@ def main():
     keep = "--keep" in args or "-k" in args
     tag = "--tag" in args or "-t" in args
     minimal = "--minimal" in args
+    apic = "--no-apic" not in args      # 默认开：PSP 靠 APIC 显示封面
     ref = None
+    cover = "auto" if "--no-cover" not in args else None   # 默认自动找封面
+    pad_to = None
+    val_idx = set()          # 这些位置是选项的值，不是待转换文件
     for i, a in enumerate(args):
         if a == "--ref" and i + 1 < len(args):
             ref = args[i + 1]
+            val_idx.add(i + 1)
         elif a.startswith("--ref="):
             ref = a[6:]
-    # --ref 后面跟的是参考文件路径，不能当成待转换文件
-    args_files = [a for a in args if not a.startswith("-") and a != ref]
+        elif a == "--cover":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                cover = args[i + 1]
+                val_idx.add(i + 1)
+            else:
+                cover = "auto"
+        elif a.startswith("--cover="):
+            cover = a[8:] or "auto"
+        elif a == "--pad" and i + 1 < len(args):
+            try:
+                pad_to = int(args[i + 1])
+            except ValueError:
+                pad_to = None
+            val_idx.add(i + 1)
+        elif a.startswith("--pad="):
+            try:
+                pad_to = int(a[6:])
+            except ValueError:
+                pad_to = None
+    # --ref / --cover 后面跟的是文件路径，不能当成待转换文件
+    args_files = [a for i, a in enumerate(args)
+                  if not a.startswith("-") and i not in val_idx and a != ref]
 
     # 拖进来的是文件夹就展开成里面的 .at3 / .aa3 / .oma（含子目录）
     files = []
@@ -633,6 +873,13 @@ def main():
         print("        --tag  / -t       写入曲目标题（TIT2 / OMG_TIT2S / TLEN）")
         print("        --minimal         不用模板，生成最小头（PSP 通常不认）")
         print("        --ref <file.oma>  指定参考文件并保存为模板")
+        print("        --cover [图片]    内嵌专辑封面（默认自动找同目录 cover.jpg /")
+        print("                          同名图片 / 目录里唯一的图片）")
+        print("        --no-cover        不找封面")
+        print("        --no-apic         只写索尼 GEOB，不写标准 APIC")
+        print("                          （默认写 —— PSP 显示封面靠 APIC，实测只写")
+        print("                            GEOB 不显示）")
+        print("        --pad <字节数>    把头部补到该长度（排查 PSP 是否容忍头部变长）")
         print()
         print("说明：at3tool 出的 .at3 是 RIFF 容器（给 PSP 游戏资源用的），")
         print("      PSP 音乐播放器认的是 EA3 容器（.aa3/.oma）。本程序只换容器，")
@@ -659,8 +906,14 @@ def main():
                            "最小合成头 —— PSP 不认，请用 --ref 指定一个能播的 .oma"))
     print("-" * 62)
     for src in files:
+        c = cover
+        if cover == "auto":
+            c = find_cover_for(src)
+            if c:
+                print("   封面：%s" % os.path.basename(c))
         try:
-            good, dst, msg = convert_one(src, keep, tag, tpl)
+            good, dst, msg = convert_one(src, keep, tag, tpl,
+                                         cover=c, pad_to=pad_to, apic=apic)
         except Exception as e:
             good, dst, msg = False, None, "%s → 失败：%s" % (os.path.basename(src), e)
         print(("[OK]   " if good else "[FAIL] ") + msg)

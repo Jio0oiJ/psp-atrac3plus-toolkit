@@ -187,12 +187,15 @@ class App:
         self.v_keep_at3 = tk.BooleanVar(value=self.cfg.get("keep_at3", False))
         self.v_keep_wav = tk.BooleanVar(value=self.cfg.get("keep_wav", False))
         self.v_del_src = tk.BooleanVar(value=False)
+        self.v_cover = tk.BooleanVar(value=self.cfg.get("cover", True))
         ttk.Checkbutton(opt, text="保留中间 .at3 文件",
                         variable=self.v_keep_at3).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
         ttk.Checkbutton(opt, text="保留中间 WAV 文件",
                         variable=self.v_keep_wav).grid(row=2, column=2, sticky="w", **pad)
         ttk.Checkbutton(opt, text="转换后删除源文件（谨慎）",
                         variable=self.v_del_src).grid(row=2, column=3, sticky="w", **pad)
+        ttk.Checkbutton(opt, text="自动嵌入专辑封面（cover.jpg / 同名图片，PSP 可显示）",
+                        variable=self.v_cover).grid(row=3, column=0, columnspan=3, sticky="w", **pad)
 
         # ---- 运行 ----
         run = ttk.Frame(self.root)
@@ -316,7 +319,8 @@ class App:
         # 保存配置
         self.cfg.update({"outdir": self.v_out.get(), "bitrate": self.v_br.get(),
                          "keep_at3": self.v_keep_at3.get(),
-                         "keep_wav": self.v_keep_wav.get()})
+                         "keep_wav": self.v_keep_wav.get(),
+                         "cover": self.v_cover.get()})
         save_config(self.cfg)
 
         self.stop_flag = False
@@ -360,6 +364,7 @@ class App:
         keep_at3 = self.v_keep_at3.get()
         keep_wav = self.v_keep_wav.get()
         del_src = self.v_del_src.get()
+        want_cover = self.v_cover.get()
 
         tpl, notes = M.resolve_template()
         for n in notes:
@@ -430,9 +435,12 @@ class App:
             self.q.put(("step", None))
 
             # --- 3) 换头 → .aa3 ---
+            cover = M.find_cover_for(src_abs) if want_cover else None
+            if cover:
+                self.q.put(("log", "   封面：%s" % os.path.basename(cover)))
             try:
                 good, dst, msg = M.convert_one(at3_path, keep=keep_at3,
-                                               tag=True, tpl=tpl)
+                                               tag=True, tpl=tpl, cover=cover)
             except Exception:
                 self.q.put(("log", "[FAIL] %s：换头异常\n%s" % (name, traceback.format_exc())))
                 good, dst, msg = False, None, ""

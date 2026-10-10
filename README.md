@@ -1,6 +1,6 @@
 # ATRAC3plus → PSP (.aa3)
 
-把任意音频转换成 **PSP 音乐播放器能直接播放的 `.aa3`** 文件。
+把任意音频转换成 **PSP 音乐播放器能直接播放、且带专辑封面的 `.aa3`** 文件。
 
 ## 作用
 
@@ -11,10 +11,10 @@
 流程：
 
 ```
-任意音频 →[ffmpeg]→ PCM WAV →[at3tool -e]→ .at3 →[换头]→ .aa3
+任意音频 →[ffmpeg]→ PCM WAV →[at3tool -e]→ .at3 →[换头+写封面]→ .aa3
 ```
 
-产物拷到记忆棒 `PSP/MUSIC/` 下即可播放。
+产物拷到记忆棒 `PSP/MUSIC/` 下即可播放，封面在 PSP 上正常显示。
 
 ## 用法
 
@@ -23,7 +23,18 @@
 1. 下载 Release 里的 `dist.zip`，解压（已包含 ffmpeg）。
 2. 运行 `ATRAC3plus转PSP.exe` → 添加文件或文件夹 → 码率选 352 → 开始。
 
-工具不用配路径，程序自动在本程序同目录查找。
+默认勾选「自动嵌入专辑封面」。工具不用配路径，程序自动在本程序同目录查找。
+
+### 封面怎么放
+
+转换时会按下面顺序找图片，找到就内嵌（自动缩到 640×640 并转成 JPEG）：
+
+1. 与音频同名的图片，如 `01. Fallen Embers.mp3` → `01. Fallen Embers.jpg`
+2. 同目录下的 `cover.jpg` / `cover.jpeg` / `cover.png` / `cover.bmp` /
+   `folder.jpg` / `album.jpg` / `front.jpg` / `artwork.jpg`
+3. 同目录下唯一的那个图片文件
+
+整张专辑用一张封面时，往文件夹里丢一个 `cover.jpg` 就够了。
 
 ### 命令行
 
@@ -37,6 +48,31 @@ at3_to_aa3.exe D:\music\at3\     # 整个文件夹递归
 
 也可以直接把文件拖到 exe 图标上。
 
+封面相关（默认已自动开启，一般不用加）：
+
+```bash
+--cover [图片]   指定封面；不给值则自动按上面顺序找
+--no-cover       不找封面
+--no-apic        只写索尼 GEOB，不写标准 APIC（PSP 将不显示封面）
+```
+
+## 关于封面的实现
+
+索尼的 `.oma` 把封面放在两个 **GEOB** 帧里（`OMG_FENCA1` 主图、`OMG_TDFCA` 缩略图位，
+索尼两张填的是同一张图），**根本没有 APIC 帧**。
+
+但真机对照实验表明 **PSP 读的是标准 APIC**：
+
+| 头部写法 | PSP 结果 |
+| --- | --- |
+| 无封面 | 不显示 |
+| 索尼 GEOB×2 | 不显示 |
+| **GEOB×2 + 标准 APIC** | **显示封面** |
+| 索尼原厂头部 | 显示（原厂当然可以） |
+
+所以本工具**同时写两种**：GEOB×2 给 SonicStage / Walkman 看，APIC 给 PSP 看，两边通吃。
+带 640×640 封面时头部约 40 KB（无封面时 3168 字节），音频部分不受影响。
+
 ## 下载
 
 [Releases](https://github.com/Jio0oiJ/psp-atrac3plus-toolkit/releases) 页面下载 `dist.zip`，解压即用。
@@ -46,9 +82,9 @@ at3_to_aa3.exe D:\music\at3\     # 整个文件夹递归
 ## 源码编译
 
 ```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "ATRAC3plus转PSP" --add-data "oma_header.bin;." atrac3plus_gui.py
-pyinstaller --onefile --console  --name at3_to_aa3        --add-data "oma_header.bin;." at3_to_aa3.py
+pip install pyinstaller pillow
+pyinstaller --onefile --windowed --name "ATRAC3plus转PSP" --collect-all PIL --add-data "oma_header.bin;." atrac3plus_gui.py
+pyinstaller --onefile --console  --name at3_to_aa3        --collect-all PIL --add-data "oma_header.bin;." at3_to_aa3.py
 ```
 
 `psp_at3tool.exe` 为索尼（SCEI）PSP SDK 中的工具，随附仅为方便使用。
