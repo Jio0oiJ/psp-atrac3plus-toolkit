@@ -23,6 +23,7 @@ import io
 import os
 import struct
 import sys
+import tempfile
 
 ATRAC3P_GUID = bytes([0xBF, 0xAA, 0x23, 0xE9, 0x58, 0xCB, 0x71, 0x44,
                       0xA1, 0x19, 0xFF, 0xFA, 0x01, 0xE4, 0xCE, 0x62])
@@ -46,6 +47,10 @@ FRAME_TO_KBPS = {
 }
 
 HEADER_TOTAL = ID3V2_HEADER_SIZE + EA3_HEADER_SIZE   # 106
+
+# 中间文件（WAV / .at3）统一放在 %TEMP% 下的这个子目录里
+TMP_SUBDIR = "psp_atrac3plus_tmp"
+TMP_ROOT = os.path.join(tempfile.gettempdir(), TMP_SUBDIR)
 
 # 【关键】索尼所有原厂 OMA 的 ID3v2 标签长度都是这个数的整数倍：
 #   无封面 3072（=1024×3）      带封面 150528（=1024×147）
@@ -415,6 +420,76 @@ def _id3v2_apic(path):
     return first
 
 
+def _id3v2_text(path, want=b"TIT2"):
+    """直接解析 ID3v2 标签里的文本帧（mp3 用，零依赖）。没有则返回 None。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+            if head[:3] != b"ID3":
+                return None
+            size = ((head[6] & 0x7F) << 21) | ((head[7] & 0x7F) << 14) | \
+                   ((head[8] & 0x7F) << 7) | (head[9] & 0x7F)
+            tag = bytearray(head + f.read(size))
+    except OSError:
+        return None
+    for fid, _hoff, doff, sz in find_frames(tag, len(tag)):
+        if fid != want:
+            continue
+        b = bytes(tag[doff:doff + sz])
+        if len(b) < 2:
+            continue
+        enc = b[0]
+        try:
+            if enc == 1:
+                bom = b[1:3]
+                return b[3:].decode("utf-16-le" if bom == b"\xff\xfe" else "utf-16-be")
+            if enc == 2:
+                return b[1:].decode("utf-16-be")
+            if enc == 3:
+                return b[1:].decode("utf-8", "replace")
+            return b[1:].decode("latin-1", "replace")
+        except Exception:
+            return None
+    return None
+
+
+def _ffmpeg_title(path, ffmpeg):
+    """用 ffmpeg 读内嵌标题（flac / m4a / ogg / wma 等通用）。
+
+    ffprobe 不在包里，所以用 `ffmpeg -i X -f ffmetadata -` 拿元数据。
+    """
+    import subprocess
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", path, "-f", "ffmetadata", "-"],
+            capture_output=True, timeout=60, **hidden_console_kwargs())
+    except Exception:
+        return None
+    if r.returncode != 0 and not r.stdout:
+        return None
+    for line in (r.stdout or b"").decode("utf-8", "replace").splitlines():
+        if line.startswith(";"):
+            continue
+        k, _, v = line.partition("=")
+        if k.strip().lower() == "title":
+            return v.strip() or None
+    return None
+
+
+def read_title(path, ffmpeg=None):
+    """读源文件内嵌的曲名。读不到返回 ""（调用方据此把 TIT2 留空）。
+
+    先自己解析 ID3v2 TIT2（mp3，零依赖），不行再叫 ffmpeg（其余格式通吃）。
+    """
+    if not os.path.isfile(path):
+        return ""
+    t = _id3v2_text(path, b"TIT2")
+    if not t and ffmpeg and os.path.isfile(ffmpeg):
+        t = _ffmpeg_title(path, ffmpeg)
+    # 有些写入方会给 UTF-16 文本带一个 0x0000 结束符，decode 后是 '\x00'
+    return (t or "").replace("\x00", "").strip()
+
+
 def _ffmpeg_apic(path, ffmpeg):
     """用 ffmpeg 抠内嵌封面（flac / m4a / ogg / wma 等，ID3v2 解析不到的靠它）。"""
     import subprocess
@@ -528,6 +603,61 @@ def build_apic(data, mime=COVER_MIME, ptype=COVER_PTYPE, desc=""):
             desc.encode("latin-1", "replace") + b"\x00" +
             data)
     return (b"APIC" + struct.pack(">I", len(body)) + b"\x00\x00" + body)
+
+
+def build_text_frame(fid, text, enc=2):
+    """文本帧（TIT2 / TLEN …）。enc=2 = UTF-16BE 无 BOM，跟索尼原厂保持一致。"""
+    body = bytes([enc]) + text.encode("utf-16-be")
+    return fid + struct.pack(">I", len(body)) + b"\x00\x00" + body
+
+
+def build_txxx_frame(desc, value, enc=2):
+    """TXXX 帧：[enc][description UTF-16BE][00 00][value UTF-16BE]"""
+    body = (bytes([enc]) +
+            desc.encode("utf-16-be") + b"\x00\x00" +
+            value.encode("utf-16-be"))
+    return b"TXXX" + struct.pack(">I", len(body)) + b"\x00\x00" + body
+
+
+def set_frames(hdr, blk, new_frames):
+    """整体替换若干帧，允许长度变化。返回 (新头部 bytes, 新的 blk)。
+
+    new_frames = [(fid, want_desc 或 None, 新帧完整字节)]
+
+    ⚠️ 为什么不能用 patch_frame：它只能就地改、不能变长，
+    遇到比模板里更长的曲名（模板 TIT2 只留了 13 个 UTF-16 字符）会**静默失败**，
+    把模板自带的曲名留在产物里 —— 表现为「所有文件都叫同一个名字」。
+    """
+    tag = bytes(hdr[:blk])
+    ea3 = bytes(hdr[blk:blk + EA3_HEADER_SIZE])
+    fr = find_frames(tag, blk)
+    if not fr:
+        raise RuntimeError("模板标签里解析不出帧")
+
+    out = bytearray(tag[:ID3V2_HEADER_SIZE])
+    used = set()
+    for fid, hoff, doff, size in fr:
+        hit = None
+        for i, (nfid, ndesc, _raw) in enumerate(new_frames):
+            if i in used or nfid != fid:
+                continue
+            if ndesc is not None:
+                d, _v = frame_desc(tag, doff, size)
+                if d != ndesc:
+                    continue
+            hit = i
+            break
+        if hit is not None:
+            used.add(hit)
+            out += new_frames[hit][2]
+        else:
+            out += tag[hoff:hoff + 10 + size]
+    # 末尾的填充区（原厂标签末尾通常一大片 0）
+    out += tag[fr[-1][1] + 10 + fr[-1][3]:blk]
+
+    body = bytes(out[ID3V2_HEADER_SIZE:])
+    new = (ID3V2_EA3_MAGIC + bytes([3, 0]) + b"\x00" + synchsafe(len(body)) + body)
+    return bytes(new) + ea3, len(new)
 
 
 def build_geob(obj, desc, mime=COVER_MIME, enc=2):
@@ -763,11 +893,17 @@ def build_from_template(tpl, blk, codec_id, channels, sample_rate,
     params = ((codec_id << 24) | (srate_index << 13) |
               (channels << 10) | (block_align // 8 - 1))
     struct.pack_into(">I", hdr, blk + 32, params)
-    if title:
-        patch_frame(hdr, b"TIT2", title)
-        patch_frame(hdr, b"TXXX", title, want_desc="OMG_TIT2S")
+    # 标题 / 时长用**整帧替换**（可以变长），不能用 patch_frame —— 它变不了长度，
+    # 曲名比模板里长时会静默失败，把模板自带的曲名留在产物里
+    want = []
+    if title is not None:
+        want.append((b"TIT2", None, build_text_frame(b"TIT2", title)))
+        want.append((b"TXXX", "OMG_TIT2S", build_txxx_frame("OMG_TIT2S", title)))
     if duration_s:
-        patch_frame(hdr, b"TLEN", str(int(round(duration_s * 1000))))
+        want.append((b"TLEN", None,
+                     build_text_frame(b"TLEN", str(int(round(duration_s * 1000))))))
+    if want:
+        hdr, blk = set_frames(hdr, blk, want)
     if cover:
         # 索尼原厂的帧顺序是 … GEOB(OMG_BKLSI) GEOB(OMG_FENCA1)
         # GEOB(OMG_OLINF) GEOB(OMG_TDFCA)，这里照抄：
@@ -788,12 +924,16 @@ def build_from_template(tpl, blk, codec_id, channels, sample_rate,
 
 
 def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
-                apic=True):
+                apic=True, title=None):
     """转换单个文件。返回 (成功与否, 输出路径或 None, 信息字符串)
 
     cover  : 封面图片路径，或图片原始字节（如从音频内嵌抠出来的），或 None
     apic   : 除索尼 GEOB 外，是否再写一个标准 APIC 帧（默认开，PSP 靠它显示）
     pad_to : 把头部补到该长度（调试用，None = 自然变长）
+    title  : 要写进 TIT2 / OMG_TIT2S 的曲名。
+             给了（哪怕是空串）就用它；没给才退回 tag=True 时用文件名。
+             建议调用方传 read_title(源文件) 的结果 —— 读不到就传 ""，
+             这样模板自带的曲名不会被留在产物里。
     """
     if not os.path.isfile(src):
         return False, None, "文件不存在：%s" % src
@@ -833,7 +973,8 @@ def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
                                   data_size - avail))
 
     frames = d[data_off:data_off + data_size]
-    title = os.path.splitext(os.path.basename(src))[0] if tag else None
+    if title is None:
+        title = os.path.splitext(os.path.basename(src))[0] if tag else None
     nframes0 = data_size // fmt["block_align"]
 
     # ---- 封面 ----
@@ -905,11 +1046,15 @@ def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
     if keep:
         msg += " | 原文件保留（--keep）"
     else:
+        # GUI 流程里 src 是临时目录中的中间 .at3，说"原文件已删除"会让人
+        # 以为源音频被删了，这里按所在位置区分措辞。
+        in_tmp = os.path.normcase(os.path.abspath(src)).startswith(
+            os.path.normcase(os.path.abspath(TMP_ROOT)) + os.sep)
         try:
             os.remove(src)
-            msg += " | 原文件已删除"
+            msg += " | 中间 .at3 已清理" if in_tmp else " | 原 .at3 已删除"
         except OSError as e:
-            msg += " | 原文件删除失败：%s" % e
+            msg += " | %s删除失败：%s" % ("中间 .at3" if in_tmp else "原 .at3", e)
     return True, dst, msg
 
 

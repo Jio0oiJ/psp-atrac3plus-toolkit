@@ -65,8 +65,7 @@ def config_path():
 
 
 def load_config():
-    cfg = {"outdir": "", "bitrate": "352",
-           "keep_at3": False, "keep_wav": False}
+    cfg = {"outdir": "", "bitrate": "352", "cover": True}
     try:
         with open(config_path(), "r", encoding="utf-8") as f:
             cfg.update(json.load(f))
@@ -135,7 +134,8 @@ def find_ffmpeg():
 
 
 # 中间文件（WAV / .at3）统一放这里，不落在输出目录里
-TMP_ROOT = os.path.join(tempfile.gettempdir(), "psp_atrac3plus_tmp")
+# 跟 at3_to_aa3.TMP_ROOT 保持同一个目录，否则"中间文件已清理"的判断会失灵
+TMP_ROOT = M.TMP_ROOT
 
 
 def mark_temporary(path):
@@ -334,16 +334,7 @@ class App:
         ttk.Label(opt, text="（留空 = 与源文件同目录；填写则保留原目录结构）").grid(
             row=1, column=3, sticky="w")
 
-        self.v_keep_at3 = tk.BooleanVar(value=self.cfg.get("keep_at3", False))
-        self.v_keep_wav = tk.BooleanVar(value=self.cfg.get("keep_wav", False))
-        self.v_del_src = tk.BooleanVar(value=False)
         self.v_cover = tk.BooleanVar(value=self.cfg.get("cover", True))
-        ttk.Checkbutton(opt, text="保留中间 .at3 文件",
-                        variable=self.v_keep_at3).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Checkbutton(opt, text="保留中间 WAV 文件",
-                        variable=self.v_keep_wav).grid(row=2, column=2, sticky="w", **pad)
-        ttk.Checkbutton(opt, text="转换后删除源文件（谨慎）",
-                        variable=self.v_del_src).grid(row=2, column=3, sticky="w", **pad)
         ttk.Checkbutton(opt, text="自动嵌入专辑封面（cover.jpg / 同名图片，PSP 可显示）",
                         variable=self.v_cover).grid(row=3, column=0, columnspan=3, sticky="w", **pad)
 
@@ -550,8 +541,6 @@ class App:
         # 保存配置
         self.cfg.update({"outdir": self._last_outdir or self.v_out.get(),
                          "bitrate": self.v_br.get(),
-                         "keep_at3": self.v_keep_at3.get(),
-                         "keep_wav": self.v_keep_wav.get(),
                          "cover": self.v_cover.get(),
                          "to_psp": self.v_to_psp.get()})
         save_config(self.cfg)
@@ -594,9 +583,6 @@ class App:
         ffmpeg = self.tools["ffmpeg"]
         outdir = self.v_out.get().strip()
         br = self.v_br.get()
-        keep_at3 = self.v_keep_at3.get()
-        keep_wav = self.v_keep_wav.get()
-        del_src = self.v_del_src.get()
         want_cover = self.v_cover.get()
 
         tpl, notes = M.resolve_template()
@@ -692,20 +678,23 @@ class App:
                 out = (r.stdout or b"").decode("utf-8", "replace").strip()
                 err = (r.stderr or b"").decode("utf-8", "replace").strip()
                 self.q.put(("log", "[FAIL] %s：at3tool 失败 %s %s" % (name, out[:200], err[:200])))
-                self._cleanup(tmp_wav, keep_wav, work, keep_at3)
+                self._cleanup(tmp_wav, False, work)
                 fail += 1
                 continue
             self.q.put(("step", None))
 
             # --- 3) 换头 → .aa3 ---
+            # 曲名：直接读源音频内嵌的标题；读不到就留空（绝不能沿用模板里自带的）
+            title = M.read_title(src_abs, ffmpeg=ffmpeg)
+            self.q.put(("log", "   曲名：%s" % (title or "（源文件没有内嵌曲名，留空）")))
             # 先找输出目录 / 源目录里的图片，找不到就从原始音频的内嵌封面里抠
             cover = (M.find_cover_for(at3_path, src_abs, ffmpeg=ffmpeg)
                      if want_cover else None)
             if cover:
                 self.q.put(("log", "   封面：%s" % M.cover_label(cover)))
             try:
-                good, dst, msg = M.convert_one(at3_path, keep=keep_at3,
-                                               tag=True, tpl=tpl, cover=cover)
+                good, dst, msg = M.convert_one(at3_path, keep=False,
+                                               title=title, tpl=tpl, cover=cover)
             except Exception:
                 self.q.put(("log", "[FAIL] %s：换头异常\n%s" % (name, traceback.format_exc())))
                 good, dst, msg = False, None, ""
@@ -716,7 +705,7 @@ class App:
                         os.remove(at3_path)
                 except OSError:
                     pass
-                self._cleanup(tmp_wav, keep_wav, work, keep_at3)
+                self._cleanup(tmp_wav, False, work)
                 fail += 1
                 continue
             self.q.put(("log", "[OK]   %s" % msg))
@@ -732,17 +721,11 @@ class App:
                 except OSError as e:
                     self.q.put(("log", "[FAIL] %s：无法移到输出目录 %s (%s)"
                                 % (name, dst_dir, e)))
-                    self._cleanup(tmp_wav, keep_wav, work, keep_at3)
+                    self._cleanup(tmp_wav, False, work)
                     fail += 1
                     continue
 
-            self._cleanup(tmp_wav, keep_wav, work, keep_at3)
-            if del_src and os.path.abspath(src) != os.path.abspath(at3_path):
-                try:
-                    os.remove(src)
-                    self.q.put(("log", "   已删除源文件"))
-                except OSError as e:
-                    self.q.put(("log", "   源文件删除失败：%s" % e))
+            self._cleanup(tmp_wav, False, work)
             ok += 1
 
         self.q.put(("log", "=" * 60))
