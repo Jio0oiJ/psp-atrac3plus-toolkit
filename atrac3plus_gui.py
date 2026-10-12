@@ -684,9 +684,15 @@ class App:
             self.q.put(("step", None))
 
             # --- 3) 换头 → .aa3 ---
-            # 曲名：直接读源音频内嵌的标题；读不到就留空（绝不能沿用模板里自带的）
-            title = M.read_title(src_abs, ffmpeg=ffmpeg)
-            self.q.put(("log", "   曲名：%s" % (title or "（源文件没有内嵌曲名，留空）")))
+            # 元数据：直接读源音频内嵌的（曲名/艺术家/专辑/流派）；
+            # 读不到就留空 —— 绝不能沿用模板里自带的值
+            tags = M.read_tags(src_abs, ffmpeg=ffmpeg)
+            self.q.put(("log", "   曲名：%s" % (
+                tags["title"] or "（源文件没有内嵌曲名，留空）")))
+            for label, key in (("艺术家", "artist"), ("专辑", "album"),
+                               ("流派", "genre")):
+                if tags[key]:
+                    self.q.put(("log", "   %s：%s" % (label, tags[key])))
             # 先找输出目录 / 源目录里的图片，找不到就从原始音频的内嵌封面里抠
             cover = (M.find_cover_for(at3_path, src_abs, ffmpeg=ffmpeg)
                      if want_cover else None)
@@ -694,7 +700,7 @@ class App:
                 self.q.put(("log", "   封面：%s" % M.cover_label(cover)))
             try:
                 good, dst, msg = M.convert_one(at3_path, keep=False,
-                                               title=title, tpl=tpl, cover=cover)
+                                               tags=tags, tpl=tpl, cover=cover)
             except Exception:
                 self.q.put(("log", "[FAIL] %s：换头异常\n%s" % (name, traceback.format_exc())))
                 good, dst, msg = False, None, ""

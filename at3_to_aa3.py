@@ -73,6 +73,23 @@ COVER_PTYPE = 3          # ID3v2 APIC picture type: $03 = 封面(front cover)
 SONY_COVER_MAIN = "OMG_FENCA1"
 SONY_COVER_THUMB = "OMG_TDFCA"
 SONY_BKLSI = "OMG_BKLSI"
+
+# 索尼在 TXXX 里另存一份自己的元数据副本（SonicStage 写的，真机上实测过）。
+# 标准帧给第三方软件看，OMG_* 给索尼自家的 SonicStage / Walkman 看，两边都写。
+# 名字规律：把标准帧 ID 中间插个 S —— TIT2→OMG_TIT2S、TPE1→OMG_TPE1S、TALB→OMG_ALBMS
+# （专辑那个不叫 OMG_TALBS，实测就是 OMG_ALBMS，别想当然改回去）
+SONY_TITLE = "OMG_TIT2S"
+SONY_ARTIST = "OMG_TPE1S"
+SONY_ALBUM = "OMG_ALBMS"
+SONY_TRACK = "OMG_TRACK"
+
+# 源文件 → 产物的元数据映射：标准帧 ID → 索尼镜像帧的 description
+TAG_FIELDS = {
+    "title": (b"TIT2", SONY_TITLE),
+    "artist": (b"TPE1", SONY_ARTIST),
+    "album": (b"TALB", SONY_ALBUM),
+    "genre": (b"TCON", None),      # 索尼只写标准 TCON，没有 OMG_ 副本
+}
 # 自动查找时的候选文件名（小写比较）
 COVER_NAMES = ("cover.jpg", "cover.jpeg", "cover.png", "cover.bmp",
                "folder.jpg", "folder.jpeg", "album.jpg", "front.jpg",
@@ -420,20 +437,25 @@ def _id3v2_apic(path):
     return first
 
 
-def _id3v2_text(path, want=b"TIT2"):
-    """直接解析 ID3v2 标签里的文本帧（mp3 用，零依赖）。没有则返回 None。"""
+def _id3v2_texts(path, wants):
+    """直接解析 ID3v2 标签里的文本帧（mp3 用，零依赖）。
+
+    wants = {帧ID bytes: 字段名}，返回 {字段名: 文本}，只含真正读到的。
+    """
+    out = {}
     try:
         with open(path, "rb") as f:
             head = f.read(10)
             if head[:3] != b"ID3":
-                return None
+                return out
             size = ((head[6] & 0x7F) << 21) | ((head[7] & 0x7F) << 14) | \
                    ((head[8] & 0x7F) << 7) | (head[9] & 0x7F)
             tag = bytearray(head + f.read(size))
     except OSError:
-        return None
+        return out
     for fid, _hoff, doff, sz in find_frames(tag, len(tag)):
-        if fid != want:
+        field = wants.get(bytes(fid))
+        if field is None or field in out:
             continue
         b = bytes(tag[doff:doff + sz])
         if len(b) < 2:
@@ -442,21 +464,29 @@ def _id3v2_text(path, want=b"TIT2"):
         try:
             if enc == 1:
                 bom = b[1:3]
-                return b[3:].decode("utf-16-le" if bom == b"\xff\xfe" else "utf-16-be")
-            if enc == 2:
-                return b[1:].decode("utf-16-be")
-            if enc == 3:
-                return b[1:].decode("utf-8", "replace")
-            return b[1:].decode("latin-1", "replace")
+                out[field] = b[3:].decode(
+                    "utf-16-le" if bom == b"\xff\xfe" else "utf-16-be")
+            elif enc == 2:
+                out[field] = b[1:].decode("utf-16-be")
+            elif enc == 3:
+                out[field] = b[1:].decode("utf-8", "replace")
+            else:
+                out[field] = b[1:].decode("latin-1", "replace")
         except Exception:
-            return None
-    return None
+            pass
+    return out
 
 
-def _ffmpeg_title(path, ffmpeg):
-    """用 ffmpeg 读内嵌标题（flac / m4a / ogg / wma 等通用）。
+def _id3v2_text(path, want=b"TIT2"):
+    """单帧版，保留给只要曲名的场合用。"""
+    return _id3v2_texts(path, {want: "v"}).get("v")
+
+
+def _ffmpeg_meta(path, ffmpeg):
+    """用 ffmpeg 读内嵌元数据（flac / m4a / ogg / wma 等通用）。
 
     ffprobe 不在包里，所以用 `ffmpeg -i X -f ffmetadata -` 拿元数据。
+    返回 {小写键: 值}，一次调用把所有字段都读回来。
     """
     import subprocess
     try:
@@ -464,30 +494,51 @@ def _ffmpeg_title(path, ffmpeg):
             [ffmpeg, "-v", "error", "-i", path, "-f", "ffmetadata", "-"],
             capture_output=True, timeout=60, **hidden_console_kwargs())
     except Exception:
-        return None
+        return {}
     if r.returncode != 0 and not r.stdout:
-        return None
+        return {}
+    out = {}
     for line in (r.stdout or b"").decode("utf-8", "replace").splitlines():
-        if line.startswith(";"):
+        if line.startswith(";") or "=" not in line:
             continue
         k, _, v = line.partition("=")
-        if k.strip().lower() == "title":
-            return v.strip() or None
-    return None
+        k = k.strip().lower()
+        if k and k not in out:
+            out[k] = v.strip()
+    return out
+
+
+def read_tags(path, ffmpeg=None):
+    """读源文件内嵌的元数据，返回 {"title","artist","album","genre"}。
+
+    读不到的字段是空串 ""（调用方据此把它留空，绝不沿用模板里自带的值）。
+    mp3 走自带 ID3v2 解析（零依赖），其余格式调 ffmpeg。
+    """
+    tags = {k: "" for k in TAG_FIELDS}
+    if not os.path.isfile(path):
+        return tags
+
+    wants = {v[0]: k for k, v in TAG_FIELDS.items()}
+    got = _id3v2_texts(path, wants)
+
+    if ffmpeg and os.path.isfile(ffmpeg):
+        # ID3v2 里没读全的，再让 ffmpeg 补一轮（flac/m4a/ogg/wma 全靠它）
+        missing = [k for k in TAG_FIELDS if not (got.get(k) or "").strip()]
+        if missing:
+            meta = _ffmpeg_meta(path, ffmpeg)
+            for k in missing:
+                if meta.get(k):
+                    got[k] = meta[k]
+
+    for k in tags:
+        # 有些写入方会给 UTF-16 文本带一个 0x0000 结束符，decode 后是 '\x00'
+        tags[k] = (got.get(k) or "").replace("\x00", "").strip()
+    return tags
 
 
 def read_title(path, ffmpeg=None):
-    """读源文件内嵌的曲名。读不到返回 ""（调用方据此把 TIT2 留空）。
-
-    先自己解析 ID3v2 TIT2（mp3，零依赖），不行再叫 ffmpeg（其余格式通吃）。
-    """
-    if not os.path.isfile(path):
-        return ""
-    t = _id3v2_text(path, b"TIT2")
-    if not t and ffmpeg and os.path.isfile(ffmpeg):
-        t = _ffmpeg_title(path, ffmpeg)
-    # 有些写入方会给 UTF-16 文本带一个 0x0000 结束符，decode 后是 '\x00'
-    return (t or "").replace("\x00", "").strip()
+    """只取曲名（旧接口的薄封装）。读不到返回 ""。"""
+    return read_tags(path, ffmpeg)["title"]
 
 
 def _ffmpeg_apic(path, ffmpeg):
@@ -619,14 +670,13 @@ def build_txxx_frame(desc, value, enc=2):
     return b"TXXX" + struct.pack(">I", len(body)) + b"\x00\x00" + body
 
 
-def set_frames(hdr, blk, new_frames):
-    """整体替换若干帧，允许长度变化。返回 (新头部 bytes, 新的 blk)。
+def set_tag_frames(hdr, blk, tags, duration_s=None):
+    """按索尼原厂的帧顺序重写元数据，允许**增删**帧。返回 (新头部, 新 blk)。
 
-    new_frames = [(fid, want_desc 或 None, 新帧完整字节)]
+    tags = {"title":…, "artist":…, "album":…, "genre":…}（缺的/空的不写）
 
-    ⚠️ 为什么不能用 patch_frame：它只能就地改、不能变长，
-    遇到比模板里更长的曲名（模板 TIT2 只留了 13 个 UTF-16 字符）会**静默失败**，
-    把模板自带的曲名留在产物里 —— 表现为「所有文件都叫同一个名字」。
+    ⚠️ 为什么不用 patch_frame：它只能就地改、长度还不能变，
+    模板里没有 TPE1/TALB 也就插不进去，更长的曲名会静默失败。
     """
     tag = bytes(hdr[:blk])
     ea3 = bytes(hdr[blk:blk + EA3_HEADER_SIZE])
@@ -634,29 +684,54 @@ def set_frames(hdr, blk, new_frames):
     if not fr:
         raise RuntimeError("模板标签里解析不出帧")
 
-    out = bytearray(tag[:ID3V2_HEADER_SIZE])
-    used = set()
-    for fid, hoff, doff, size in fr:
-        hit = None
-        for i, (nfid, ndesc, _raw) in enumerate(new_frames):
-            if i in used or nfid != fid:
-                continue
-            if ndesc is not None:
-                d, _v = frame_desc(tag, doff, size)
-                if d != ndesc:
-                    continue
-            hit = i
-            break
-        if hit is not None:
-            used.add(hit)
-            out += new_frames[hit][2]
-        else:
-            out += tag[hoff:hoff + 10 + size]
-    # 末尾的填充区（原厂标签末尾通常一大片 0）
-    out += tag[fr[-1][1] + 10 + fr[-1][3]:blk]
+    # 用 SonicStage 写入艺术家/专辑后的原厂文件实测出的顺序：
+    #   TIT2 TPE1 TALB TCON → TXXX(OMG_TPE1S) TXXX(OMG_TRACK)
+    #   TXXX(OMG_ALBMS) TXXX(OMG_TIT2S) → TLEN → GEOB…
+    managed_txt = (b"TIT2", b"TPE1", b"TALB", b"TCON", b"TLEN")
+    managed_txxx = (SONY_TITLE, SONY_ARTIST, SONY_ALBUM, SONY_TRACK)
 
-    body = bytes(out[ID3V2_HEADER_SIZE:])
-    new = (ID3V2_EA3_MAGIC + bytes([3, 0]) + b"\x00" + synchsafe(len(body)) + body)
+    others, keep_track, keep_tlen = [], None, None
+    for fid, hoff, doff, size in fr:
+        raw = bytes(tag[hoff:hoff + 10 + size])
+        if fid == b"TXXX":
+            desc = frame_desc(tag, doff, size)[0]
+            if desc == SONY_TRACK:
+                keep_track = raw
+                continue
+            if desc in managed_txxx:
+                continue
+        elif fid in managed_txt:
+            if fid == b"TLEN":
+                keep_tlen = raw
+            continue
+        others.append(raw)                  # GEOB 之类，原样留在后面
+
+    get = (tags or {}).get
+    out = bytearray()
+    if get("title") is not None:            # 曲名永远写（读不到就写空，不沿用模板）
+        out += build_text_frame(b"TIT2", get("title") or "")
+    if get("artist"):
+        out += build_text_frame(b"TPE1", get("artist"))
+    if get("album"):
+        out += build_text_frame(b"TALB", get("album"))
+    if get("genre"):
+        out += build_text_frame(b"TCON", get("genre"))
+    if get("artist"):
+        out += build_txxx_frame(SONY_ARTIST, get("artist"))
+    if keep_track:
+        out += keep_track
+    if get("album"):
+        out += build_txxx_frame(SONY_ALBUM, get("album"))
+    if get("title") is not None:
+        out += build_txxx_frame(SONY_TITLE, get("title") or "")
+    if duration_s:
+        out += build_text_frame(b"TLEN", str(int(round(duration_s * 1000))))
+    elif keep_tlen:
+        out += keep_tlen
+    out += b"".join(others)
+
+    new = (ID3V2_EA3_MAGIC + bytes([3, 0]) + b"\x00" + synchsafe(len(out)) +
+           bytes(out))
     return bytes(new) + ea3, len(new)
 
 
@@ -880,30 +955,26 @@ def discover_ref():
 
 def build_from_template(tpl, blk, codec_id, channels, sample_rate,
                         block_align, frames, title, duration_s,
-                        cover=None, pad_to=None, apic=True):
+                        cover=None, pad_to=None, apic=True, tags=None):
     """在原厂头部基础上改参数，返回 (bytes, params)
 
     cover  : 已压好的 JPEG 字节，写成 GEOB×2（+ APIC）
     apic   : 是否额外写标准 APIC 帧。默认开 —— PSP 显示封面靠它
              （真机实测：只写 GEOB×2 不显示，加上 APIC 才显示）
     pad_to : 把整个头部补到这个长度（None = 随封面自然变长）
+    tags   : {"title","artist","album","genre"}，从源文件读来的元数据。
+             给了就用它（可以增删帧）；没给才退回 title 参数。
     """
     hdr = bytearray(tpl)
     srate_index = OMA_SRATE_TAB.index(sample_rate // 100)
     params = ((codec_id << 24) | (srate_index << 13) |
               (channels << 10) | (block_align // 8 - 1))
     struct.pack_into(">I", hdr, blk + 32, params)
-    # 标题 / 时长用**整帧替换**（可以变长），不能用 patch_frame —— 它变不了长度，
-    # 曲名比模板里长时会静默失败，把模板自带的曲名留在产物里
-    want = []
-    if title is not None:
-        want.append((b"TIT2", None, build_text_frame(b"TIT2", title)))
-        want.append((b"TXXX", "OMG_TIT2S", build_txxx_frame("OMG_TIT2S", title)))
-    if duration_s:
-        want.append((b"TLEN", None,
-                     build_text_frame(b"TLEN", str(int(round(duration_s * 1000))))))
-    if want:
-        hdr, blk = set_frames(hdr, blk, want)
+    # 元数据用**整帧重写**（可以增删、可以变长），不能用 patch_frame ——
+    # 它变不了长度，曲名比模板里长时会静默失败，把模板自带的曲名留在产物里
+    if tags is None:
+        tags = {"title": title, "artist": "", "album": "", "genre": ""}
+    hdr, blk = set_tag_frames(hdr, blk, tags, duration_s)
     if cover:
         # 索尼原厂的帧顺序是 … GEOB(OMG_BKLSI) GEOB(OMG_FENCA1)
         # GEOB(OMG_OLINF) GEOB(OMG_TDFCA)，这里照抄：
@@ -924,16 +995,16 @@ def build_from_template(tpl, blk, codec_id, channels, sample_rate,
 
 
 def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
-                apic=True, title=None):
+                apic=True, title=None, tags=None):
     """转换单个文件。返回 (成功与否, 输出路径或 None, 信息字符串)
 
     cover  : 封面图片路径，或图片原始字节（如从音频内嵌抠出来的），或 None
     apic   : 除索尼 GEOB 外，是否再写一个标准 APIC 帧（默认开，PSP 靠它显示）
     pad_to : 把头部补到该长度（调试用，None = 自然变长）
-    title  : 要写进 TIT2 / OMG_TIT2S 的曲名。
-             给了（哪怕是空串）就用它；没给才退回 tag=True 时用文件名。
-             建议调用方传 read_title(源文件) 的结果 —— 读不到就传 ""，
-             这样模板自带的曲名不会被留在产物里。
+    title  : 要写进 TIT2 / OMG_TIT2S 的曲名（旧参数，只管曲名）
+    tags   : {"title","artist","album","genre"}，从源文件读来的元数据。
+             建议调用方传 read_tags(源文件) 的结果 —— 读不到的字段给空串，
+             这样模板自带的值不会被留在产物里。给了 tags 就忽略 title。
     """
     if not os.path.isfile(src):
         return False, None, "文件不存在：%s" % src
@@ -973,7 +1044,7 @@ def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
                                   data_size - avail))
 
     frames = d[data_off:data_off + data_size]
-    if title is None:
+    if tags is None and title is None:
         title = os.path.splitext(os.path.basename(src))[0] if tag else None
     nframes0 = data_size // fmt["block_align"]
 
@@ -996,7 +1067,7 @@ def convert_one(src, keep=False, tag=False, tpl=None, cover=None, pad_to=None,
             hdr, blk, codec_id, fmt["channels"], fmt["sample_rate"],
             fmt["block_align"], frames, title,
             nframes0 * 2048 / fmt["sample_rate"],
-            cover=cover_bytes, pad_to=pad_to, apic=apic)
+            cover=cover_bytes, pad_to=pad_to, apic=apic, tags=tags)
     else:
         blob, params = build_ea3(codec_id, fmt["channels"], fmt["sample_rate"],
                                  fmt["block_align"], frames, title)
